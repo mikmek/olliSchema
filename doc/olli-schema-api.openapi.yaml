@@ -1,0 +1,353 @@
+openapi: 3.1.0
+info:
+  title: olliSchema API
+  version: 0.1.0
+  description: >-
+    Auflösung, Auslieferung und Validierung der Schemas einer Plattform-Instanz (ADR-0063). olliSchema
+    hat kein eigenes Write-Modell: Schemas sind Entities mit Schema-kind im EntityService; das
+    Lesemodell entsteht aus `entity.events`. Beschreibung: ../../doc/schema-service.md.
+servers:
+  - url: http://localhost:8110
+paths:
+  /health/live:
+    get:
+      summary: Liveness probe
+      responses:
+        '200': { description: Process is running, content: { application/json: { schema: { $ref: '#/components/schemas/Health' } } } }
+  /health/ready:
+    get:
+      summary: Readiness probe (Redis erreichbar und Consumer an Kafka angemeldet)
+      responses:
+        '200': { description: Ready, content: { application/json: { schema: { $ref: '#/components/schemas/Health' } } } }
+        '503': { description: Not ready, content: { application/json: { schema: { $ref: '#/components/schemas/Health' } } } }
+  /metrics:
+    get:
+      summary: Service metrics (platform-observability, immer 200)
+      responses:
+        '200': { description: Counters, content: { application/json: { schema: { $ref: '#/components/schemas/Metrics' } } } }
+
+  /ollischema/{path}:
+    get:
+      summary: Schema per URL im Namensraum https://bizgrid.de/ollischema/ (REQ-SCH-002)
+      description: >-
+        Der Reverse-Proxy bildet `https://bizgrid.de/ollischema/<path>` auf diese Route ab. Gilt für
+        Released-, Draft-, `by-id/<uuid>`- und `ext/<herausgeber>/…`-URLs. `Accept: application/schema+json`
+        (Default, auch `*/*`) liefert das Dokument, ein ausdrückliches `application/json` die Hülle mit
+        Metadaten und Gültigkeit. Released-Stände tragen `Cache-Control: public, max-age=31536000, immutable`,
+        Drafts `no-cache`; alle tragen einen ETag und beantworten `If-None-Match` mit 304.
+      parameters:
+        - { name: path, in: path, required: true, schema: { type: string }, example: rave/building/room-v1.json }
+      responses:
+        '200':
+          description: Schema
+          headers:
+            X-Olli-Schema-Uuid: { schema: { type: string, format: uuid } }
+            X-Olli-Schema-Validity: { schema: { type: string, enum: [valid, invalid, unresolved] } }
+            X-Olli-Schema-Status: { schema: { type: string, enum: [draft, released, deprecated, withdrawn] } }
+          content:
+            application/schema+json: { schema: { type: object } }
+            application/json: { schema: { $ref: '#/components/schemas/SchemaEnvelope' } }
+        '304': { description: Not modified }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /schemas:
+    get:
+      summary: Listing nach application und domain
+      parameters:
+        - { name: application, in: query, schema: { type: string }, description: '`ext` listet die Fremdschemas' }
+        - { name: domain, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string, enum: [draft, released, deprecated, withdrawn] } }
+        - { name: branch, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: Schemas
+          content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/SchemaSummary' } } } } } }
+  /schemas/{uuid}:
+    parameters: [ { $ref: '#/components/parameters/Uuid' } ]
+    get:
+      summary: Schema per UUID, Content Negotiation wie /ollischema/{path}
+      responses:
+        '200':
+          description: Schema
+          content:
+            application/schema+json: { schema: { type: object } }
+            application/json: { schema: { $ref: '#/components/schemas/SchemaEnvelope' } }
+        '404': { $ref: '#/components/responses/Error' }
+  /schemas/{uuid}/validity:
+    parameters: [ { $ref: '#/components/parameters/Uuid' } ]
+    get:
+      summary: Schema-Gültigkeit (REQ-SCH-007, ADR-0064)
+      responses:
+        '200': { description: Validity, content: { application/json: { schema: { $ref: '#/components/schemas/SchemaValidity' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+  /schemas/{uuid}/referers:
+    parameters: [ { $ref: '#/components/parameters/Uuid' } ]
+    get:
+      summary: CheckReferer (REQ-SCH-006)
+      description: >-
+        Referenzierende Schemas aus dem Reverse-Index und die Verwender laut EntityIndex
+        (`GET /entities?tag=schema:<url>` je Adresse des Schemas). Ist der EntityIndex nicht
+        erreichbar, ist `entities` null und `entitiesError` gesetzt.
+      responses:
+        '200':
+          description: Referers
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [uuid, schemas, entities]
+                properties:
+                  uuid: { type: string, format: uuid }
+                  schemas: { type: array, items: { $ref: '#/components/schemas/SchemaSummary' } }
+                  entities:
+                    oneOf:
+                      - type: 'null'
+                      - type: object
+                        properties:
+                          count: { type: integer }
+                          truncated: { type: boolean }
+                          items: { type: array, items: { type: string, format: uuid } }
+                  entitiesError: { type: string }
+        '404': { $ref: '#/components/responses/Error' }
+  /schemas/{uuid}/release-check:
+    parameters:
+      - { $ref: '#/components/parameters/Uuid' }
+      - { name: entityVersion, in: query, required: true, schema: { type: integer, format: int64 }, description: Gepinnte Entity-Version des Drafts }
+    get:
+      summary: Release-Prüfung für den FSM-Guard (REQ-SCH-010)
+      description: >-
+        Prüft genau die gepinnte Entity-Version. Weicht die gespeicherte Gültigkeit vom Stand ab, wird
+        neu gerechnet (TOCTOU). Liefert die Pins Draft-URL → Released-URL für Referenzen auf Drafts
+        desselben Branches und die nächste Versionsnummer.
+      responses:
+        '200': { description: Result, content: { application/json: { schema: { $ref: '#/components/schemas/ReleaseCheck' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+        '409':
+          description: >-
+            `projection-behind` (olliSchema hat die Version noch nicht projiziert, wiederholen) oder
+            `version-mismatch` (die Entity ist weiter).
+          content: { application/json: { schema: { type: object, properties: { error: { type: string }, projectedVersion: { type: integer }, message: { type: string } } } } }
+  /schemas/{uuid}/meta:
+    parameters:
+      - { $ref: '#/components/parameters/Uuid' }
+      - { name: type, in: query, schema: { type: string, enum: [layout, alert, filter] } }
+    get:
+      summary: Meta-Schemas, die an dieses Schema binden (REQ-SCH-011)
+      responses:
+        '200':
+          description: Meta-schemas
+          content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/SchemaSummary' } } } } } }
+
+  /validate:
+    post:
+      summary: Validierung von noch nicht gespeichertem JSON (REQ-SCH-009)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [schema, data]
+              properties:
+                schema: { type: string, description: 'Schema-URL, auch by-id, Original-URI eines Fremdschemas oder mit Fragment (#/$defs/…)' }
+                data: {}
+                maxErrors: { type: integer, minimum: 1 }
+      responses:
+        '200': { description: Result with full error list, content: { application/json: { schema: { $ref: '#/components/schemas/ValidationResult' } } } }
+        '400': { $ref: '#/components/responses/Error' }
+        '422': { description: Schema not in the local registry or not compilable }
+        '503': { description: Validation exceeded its time limit }
+  /entities/{id}/validation:
+    parameters: [ { name: id, in: path, required: true, schema: { type: string, format: uuid } } ]
+    get:
+      summary: Entity-Validierungsergebnis (REQ-SCH-008)
+      parameters:
+        - { name: full, in: query, schema: { type: boolean, default: false }, description: Volle Fehlerliste neu berechnen }
+      responses:
+        '200': { description: Compact result or full result, content: { application/json: { schema: { $ref: '#/components/schemas/EntityValidity' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+    post:
+      summary: Entity sofort neu validieren
+      responses:
+        '200': { description: Result, content: { application/json: { schema: { $ref: '#/components/schemas/EntityValidity' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /imports:
+    post:
+      summary: Fremdschema importieren (REQ-SCH-013)
+      description: >-
+        Lädt das Schema und seine transitiven Abhängigkeiten (Allowlist, nur https, keine Redirects,
+        keine internen Ziele, Größen- und Zeitlimit) und registriert sie unverändert als
+        Schema-Entities in der EntityRegistry. Der Alias Original-URI → UUID entsteht in der Projektion.
+      parameters:
+        - { name: X-Olli-Principal, in: header, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [uri, publisher]
+              properties:
+                uri: { type: string, format: uri }
+                publisher: { type: string, pattern: '^[a-z][a-z0-9_]{0,62}$' }
+                tenant: { type: string, format: uuid, description: Default Nil-UUID (beliebiger Tenant) }
+                project: { type: string, format: uuid, description: Default Nil-UUID }
+      responses:
+        '202':
+          description: Registered (projection follows asynchronously)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        originalUri: { type: string }
+                        url: { type: string }
+                        entityId: { type: string, format: uuid }
+                        outcome: { type: string, enum: [registered, already-imported, in-progress] }
+        '400': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /diagnostics/violations:
+    get:
+      summary: Zuletzt erkannte Verletzungen der Unveränderlichkeit von Released-Schemas
+      parameters: [ { name: limit, in: query, schema: { type: integer, default: 100, maximum: 1000 } } ]
+      responses:
+        '200': { description: Items, content: { application/json: { schema: { type: object } } } }
+  /diagnostics/dead-letters:
+    get:
+      summary: Zuletzt verworfene Records von entity.events (Fundstelle und Grund, kein Payload)
+      parameters: [ { name: limit, in: query, schema: { type: integer, default: 100, maximum: 1000 } } ]
+      responses:
+        '200': { description: Items, content: { application/json: { schema: { type: object } } } }
+
+components:
+  parameters:
+    Uuid: { name: uuid, in: path, required: true, schema: { type: string, format: uuid } }
+  responses:
+    Error:
+      description: Error
+      content: { application/json: { schema: { type: object, required: [error], properties: { error: { type: string } } } } }
+  schemas:
+    Health:
+      type: object
+      properties:
+        status: { type: string }
+        service: { type: string, const: olli-schema }
+        redis: { type: boolean }
+        consumer: { type: boolean }
+    Metrics:
+      type: object
+      required: [service, status, uptimeSeconds, metrics]
+      properties:
+        service: { type: string }
+        status: { type: string, const: ok }
+        uptimeSeconds: { type: number }
+        metrics: { type: object, additionalProperties: { type: number } }
+    Problem:
+      type: object
+      required: [code, message, severity]
+      properties:
+        code: { type: string }
+        message: { type: string }
+        severity: { type: string, enum: [error, warning] }
+        pointer: { type: string, description: JSON Pointer (RFC 6901) }
+    SchemaInfo:
+      type: object
+      properties:
+        status: { type: string, enum: [draft, released, deprecated, withdrawn] }
+        application: { type: string }
+        domain: { type: string }
+        class: { type: string }
+        version: { type: integer }
+        branch: { type: string }
+        tenant: { type: string, format: uuid }
+        basedOn: { type: integer }
+        metaType: { type: string, enum: [layout, alert, filter] }
+        target: { type: string }
+        external:
+          type: object
+          properties: { publisher: { type: string }, path: { type: string }, originalUri: { type: string } }
+    SchemaSummary:
+      type: object
+      required: [uuid, byIdUrl, language, entityVersion, etag]
+      properties:
+        uuid: { type: string, format: uuid }
+        url: { type: string }
+        byIdUrl: { type: string }
+        language: { type: string }
+        info: { $ref: '#/components/schemas/SchemaInfo' }
+        entityVersion: { type: integer, format: int64 }
+        etag: { type: string }
+        tenant: { type: string, format: uuid }
+        project: { type: string, format: uuid }
+        registeredAt: { type: string, format: date-time }
+        validityState: { type: string, enum: [valid, invalid, unresolved] }
+    SchemaEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/SchemaSummary'
+        - type: object
+          properties:
+            document: {}
+            refs: { type: array, items: { type: string } }
+            infoProblems: { type: array, items: { $ref: '#/components/schemas/Problem' } }
+            validity: { $ref: '#/components/schemas/SchemaValidity' }
+    SchemaValidity:
+      type: object
+      required: [state, entityVersion, etag, checkedAt, problems]
+      properties:
+        state: { type: string, enum: [valid, invalid, unresolved] }
+        entityVersion: { type: integer, format: int64 }
+        etag: { type: string }
+        checkedAt: { type: string, format: date-time }
+        problems: { type: array, items: { $ref: '#/components/schemas/Problem' } }
+    ReleaseCheck:
+      type: object
+      required: [uuid, releasable, entityVersion, validity, pins, problems]
+      properties:
+        uuid: { type: string, format: uuid }
+        url: { type: string }
+        releasable: { type: boolean }
+        entityVersion: { type: integer, format: int64 }
+        targetVersion: { type: integer }
+        nextVersion: { type: integer }
+        releasedUrl: { type: string }
+        validity: { $ref: '#/components/schemas/SchemaValidity' }
+        pins: { type: array, items: { type: object, properties: { from: { type: string }, to: { type: string } } } }
+        problems: { type: array, items: { $ref: '#/components/schemas/Problem' } }
+    ValidationError:
+      type: object
+      properties:
+        pointer: { type: string, description: JSON Pointer (RFC 6901) in die Instanz }
+        keyword: { type: string }
+        message: { type: string }
+    ValidationResult:
+      type: object
+      properties:
+        state: { type: string, enum: [valid, invalid] }
+        schemaUrl: { type: string }
+        schemaUuid: { type: string, format: uuid }
+        schemaVersion: { type: integer }
+        schemaEntityVersion: { type: integer, format: int64 }
+        errorCount: { type: integer }
+        errors: { type: array, items: { $ref: '#/components/schemas/ValidationError' } }
+    EntityValidity:
+      type: object
+      properties:
+        entityId: { type: string, format: uuid }
+        state: { type: string, enum: [pending, valid, invalid, stale, schema-missing] }
+        schemaUrl: { type: string }
+        schemaUuid: { type: string, format: uuid }
+        schemaVersion: { type: integer }
+        schemaEntityVersion: { type: integer, format: int64 }
+        entityVersion: { type: integer, format: int64 }
+        errorCount: { type: integer }
+        errors: { type: array, items: { $ref: '#/components/schemas/ValidationError' } }
+        checkedAt: { type: string, format: date-time }
+        detail: { type: string }

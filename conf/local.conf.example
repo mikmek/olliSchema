@@ -1,0 +1,15 @@
+# Lokaler Betrieb des gestageten Artefakts (ADR-0027).
+#
+#   cp conf/local.conf.example conf/local.conf
+#   target/universal/stage/bin/olli-schema -Dconfig.file=<absoluter Pfad>/conf/local.conf
+#
+# Pflichtzeile: -Dconfig.file ersetzt die application.conf des Artefakts.
+include classpath("application.conf")
+
+ollischema {
+  kafka.bootstrap-servers = ["localhost:9092"]
+  # Host-Port der olli-schema-redis aus docker-compose.app.yml.
+  redis { host = "localhost", port = 6380 }
+  entity-index.base-url = "http://localhost:8081"
+  entity-registry.base-url = "http://localhost:8080"
+}

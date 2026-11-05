@@ -1,0 +1,56 @@
+# olliSchema-Container mit eigener Redis-Instanz (ADR-0063, ADR-0068).
+#
+# Voraussetzungen:
+#   1. cd ../olliEventCore && sbt publishAll
+#   2. sbt Docker/publishLocal            (baut olli-schema:0.1.0-SNAPSHOT lokal)
+#   3. docker compose -f C:/workspace/infrastructure/docker-compose.yml up -d
+#   4. cp conf/olli-schema.conf.example conf/olli-schema.conf
+#   5. docker compose -f docker-compose.app.yml up -d
+#
+# Kafka laeuft in der Infrastruktur-Compose; deren Netz wird als externes Netz eingebunden
+# (standardmaessig infrastructure_default, pruefen mit `docker network ls`). Die Redis-Instanz gehoert
+# allein olliSchema und ist bewusst nicht die Redis des EntityIndex (ADR-0068).
+
+services:
+  schema-redis:
+    image: redis:7-alpine
+    container_name: olli-schema-redis
+    restart: unless-stopped
+    networks: [infra]
+    # AOF everysec: alles ist aus entity.events rekonstruierbar (REQ-SCH-018), ein Verlust der letzten
+    # Sekunde kostet nur eine Reprojektion. Mit dem Betrieb zu bestaetigen (ADR-0068).
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - ./data/redis:/data
+    ports: ["6380:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  schema:
+    image: olli-schema:${OLLI_SCHEMA_TAG:-0.1.0-SNAPSHOT}
+    container_name: olli-schema
+    restart: unless-stopped
+    networks: [infra]
+    depends_on:
+      schema-redis:
+        condition: service_healthy
+    environment:
+      JAVA_OPTS: -Dconfig.file=/etc/olli/olli-schema.conf
+    volumes:
+      - ./conf/olli-schema.conf:/etc/olli/olli-schema.conf:ro
+    ports: ["8110:8110"]
+    healthcheck:
+      # Ohne curl im JRE-Image: bash-TCP-Probe wie bei den uebrigen olliServices.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8110"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+networks:
+  infra:
+    external: true
+    name: ${OLLI_INFRA_NETWORK:-infrastructure_default}

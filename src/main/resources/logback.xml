@@ -1,0 +1,27 @@
+<!--
+  Ohne diese Datei faellt Logback auf seine Default-Konfiguration zurueck: Root-Level DEBUG. Der
+  Kafka-Client protokolliert dann jede FETCH-Runde und bei jedem Consumer-Aufbau den vollstaendigen
+  ConsumerConfig-Dump — in den Worker- und Projection-Containern waren das je ueber 1,2 Millionen
+  Zeilen, in denen die eigentlichen Fehler nicht mehr auffindbar waren.
+
+  Alle Module teilen dieselbe Konfiguration; Abweichungen gehoeren in das jeweilige Modul, nicht in
+  eine Kopie mit anderem Default.
+-->
+<configuration>
+  <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder>
+      <pattern>%date %-5level %logger - %msg%n</pattern>
+    </encoder>
+  </appender>
+
+  <!-- Verbindungsauf- und -abbau bleiben auf WARN sichtbar, das Poll-Rauschen verschwindet. -->
+  <logger name="org.apache.kafka" level="WARN" />
+
+  <!-- networknt meldet jede nicht aufloesbare Referenz als ERROR mit Stacktrace. olliSchema loest nur
+       gegen die lokale Registry auf; der Befund steht als Problem in der Schema-Gueltigkeit. -->
+  <logger name="com.networknt.schema" level="OFF" />
+
+  <root level="INFO">
+    <appender-ref ref="STDOUT" />
+  </root>
+</configuration>

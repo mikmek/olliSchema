@@ -1,0 +1,20 @@
+# Container-Konfiguration fuer olliSchema (ADR-0027), eingebunden von docker-compose.app.yml.
+#
+#   cp conf/olli-schema.conf.example conf/olli-schema.conf
+#
+# Pflichtzeile: -Dconfig.file ersetzt die application.conf des Artefakts.
+include classpath("application.conf")
+
+ollischema {
+  kafka.bootstrap-servers = ["broker:29092"]
+  # Eigene Instanz aus docker-compose.app.yml, nicht die Redis des EntityIndex.
+  redis { host = "schema-redis", port = 6379 }
+  entity-index.base-url = "http://entity-index:8081"
+  entity-registry.base-url = "http://entity-registry:8080"
+
+  # Fremdschema-Import nur fuer ausdruecklich berechtigte Principals und erlaubte Hosts (ADR-0069).
+  # import {
+  #   allowed-principals = ["<uuid>"]
+  #   allowed-hosts = [".buildingsmart.org"]
+  # }
+}
