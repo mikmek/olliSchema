@@ -13,6 +13,7 @@ Set-StrictMode -Version Latest
 $repository = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $eventCore = (Resolve-Path (Join-Path $repository '..\olliEventCore')).Path
 if ($Server -notmatch '^[a-zA-Z0-9_.@-]+$') { throw 'Invalid SSH host name.' }
+$sshOptions = @('-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=3')
 
 function Invoke-Checked {
     param([string]$Program, [string[]]$Arguments)
@@ -31,8 +32,13 @@ function Get-Commit {
     return $commit
 }
 
+if ($Action -in @('Deploy', 'Status', 'Rollback')) {
+    Write-Host 'Checking SSH agent authentication...'
+    Invoke-Checked -Program ssh -Arguments ($sshOptions + @($Server, 'true'))
+}
+
 if ($Action -in @('Status', 'Rollback')) {
-    Invoke-Checked -Program ssh -Arguments @('-t', $Server, "sudo /usr/local/lib/olli-deploy/schema.py $($Action.ToLowerInvariant())")
+    Invoke-Checked -Program ssh -Arguments ($sshOptions + @('-t', $Server, "sudo /usr/local/lib/olli-deploy/schema.py $($Action.ToLowerInvariant())"))
     return
 }
 
@@ -111,13 +117,13 @@ if ((Get-FileHash -LiteralPath $archive).Hash.ToLowerInvariant() -ne $manifest.a
 Write-Host "Release ready: $ReleaseDirectory"
 if ($Action -eq 'Build') { return }
 
-Invoke-Checked -Program ssh -Arguments @($Server, "mkdir -p /srv/olli/incoming/schema/$release")
-Invoke-Checked -Program scp -Arguments @($archive, $manifestPath, "${Server}:/srv/olli/incoming/schema/$release/")
+Invoke-Checked -Program ssh -Arguments ($sshOptions + @($Server, "mkdir -p /srv/olli/incoming/schema/$release"))
+Invoke-Checked -Program scp -Arguments ($sshOptions + @($archive, $manifestPath, "${Server}:/srv/olli/incoming/schema/$release/"))
 # Interactive SSH/sudo is deliberate: no password storage and no blanket passwordless sudo.
 $deploymentLog = Join-Path $ReleaseDirectory 'deployment.log'
 "Started $((Get-Date).ToUniversalTime().ToString('o')) release=$release server=$Server" | Set-Content -LiteralPath $deploymentLog
 # Keep the native console attached: line-buffered pipelines hide sudo's prompt (no newline).
-& ssh -t $Server "sudo /usr/local/lib/olli-deploy/schema.py apply $release"
+& ssh @sshOptions -t $Server "sudo /usr/local/lib/olli-deploy/schema.py apply $release"
 $remoteExit = $LASTEXITCODE
 "Finished $((Get-Date).ToUniversalTime().ToString('o')) exit=$remoteExit" | Add-Content -LiteralPath $deploymentLog
 if ($remoteExit -ne 0) { throw "Remote deployment failed with exit code $remoteExit. Inspect deployment.log." }

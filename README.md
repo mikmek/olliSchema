@@ -6,7 +6,9 @@ Der lokale Build-/Übertragungs-/Rollout-Ablauf ist unter
 [deploy/README.md](deploy/README.md) dokumentiert. Einstieg:
 `scripts/Deploy-OlliSchema.ps1`. Er setzt saubere committete Quellen voraus,
 baut auf dem Notebook und archiviert Releases auf der Server-HDD.
-Die einmalige Serverinstallation und erste fachliche Abnahme stehen noch aus.
+Die Serverwerkzeuge sind installiert; das erste Release ist technisch bereit und
+der PowerShell-Statusaufruf funktioniert. Vollständiger zweiter Rollout, realer
+Rollback-Test und fachliche Prüfung des Projektionsbestands stehen noch aus.
 
 `olliSchema` ist die Autorität über alle Schemas einer Plattform-Instanz (Namensraum
 `https://bizgrid.de/ollischema/`). Schemas sind Entities mit Schema-`kind` im EntityService; olliSchema

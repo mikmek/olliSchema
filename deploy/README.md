@@ -2,13 +2,17 @@
 
 Stand: 2026-11-07. Umsetzung für olliSchema als erster Service.
 GitHub speichert Quellcode; Build/Tests laufen auf dem Notebook. Es werden keine GitHub
-Actions oder Registry benötigt. Der erste reale Rollout ist noch gemeinsam abzunehmen.
+Actions oder Registry benötigt. Release `20261107T151434Z-91761c2624e7` wurde übertragen
+und direkt in einer SSH-Sitzung aktiviert. Readiness vom Notebook und der Statusaufruf
+über PowerShell einschließlich sudo sind bestätigt. Zweiter vollständiger Rollout und
+ein realer Rollback-Test stehen noch aus.
 
 ## Voraussetzungen
 
 - Windows PowerShell 5.1 oder PowerShell 7, Git, sbt, JDK 21 und laufendes Docker Desktop.
 - Saubere, committete Repositories olliSchema und benachbartes olliEventCore.
-- SSH-Alias `olli-server`; bei Bedarf WireGuard aktiv. Passphrase-/sudo-Abfragen bleiben interaktiv.
+- SSH-Alias `olli-server`; bei Bedarf WireGuard aktiv. Der private Schlüssel muss im
+  Windows-SSH-Agenten geladen sein. sudo wird weiterhin interaktiv bestätigt.
 - Server: Python 3.12+, Docker/Compose, Netz `infrastructure_default`, laufender Kafka-Broker
   und die Entity-APIs. Bestehendes Redis-Image `olli-migration/image-b6636bae9624:backup`.
 - HDD unter `/srv/olli-data` tatsächlich gemountet; keine öffentliche Portfreigabe erforderlich.
@@ -70,10 +74,23 @@ Eine Release-ID wird nicht überschrieben. Bei Abbruch Zustand/Logs prüfen und 
 teilweise angelegte Release-ID blind erneut verwenden.
 
 Startzeit, Release und Exitcode werden lokal als `deployment.log` gespeichert.
-Die SSH-Ausgabe bleibt direkt am Terminal, damit Passwortabfragen sichtbar bleiben.
+Die SSH-Ausgabe bleibt direkt am Terminal, damit sudo-Passwortabfragen sichtbar bleiben.
 Serverseitige Docker-Befehlsausgaben werden im Releaseordner protokolliert.
-Anmeldedaten werden nicht im Skript hinterlegt. SSH-/sudo-Anmeldung ist weiterhin nötig;
-für weniger Passphrase-Abfragen kann später ein SSH-Agent eingerichtet werden.
+Anmeldedaten werden nicht im Skript hinterlegt. Vor jedem Remote-Vorgang wird die
+Agent-Anmeldung mit BatchMode und zehn Sekunden Verbindungs-Timeout geprüft.
+Ohne geladenen Schlüssel bricht der Ablauf früh ab, statt mehrfach die Passphrase abzufragen.
+Keepalives erkennen eine abgebrochene Verbindung nach erfolgreicher Anmeldung;
+sie ersetzen nicht die Agent-Anmeldung und lösen keinen Daten-Rollback aus.
+
+Der Windows-Dienst `ssh-agent` wurde aktiviert. Schlüssel laden und Verbindung prüfen:
+
+```powershell
+ssh-add "$env:USERPROFILE\.ssh\olli_server_ed25519"
+ssh -o BatchMode=yes -o ConnectTimeout=10 olli-server "echo SSH_OK"
+```
+
+Die ursprüngliche Abbruchursache war im SSH-Protokoll nicht eindeutig erkennbar.
+Nach Laden des Schlüssels funktionierten SSH_OK und der interaktive sudo-Statusaufruf.
 
 ## Verhalten auf dem Server
 
