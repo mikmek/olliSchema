@@ -15,7 +15,7 @@ $eventCore = (Resolve-Path (Join-Path $repository '..\olliEventCore')).Path
 if ($Server -notmatch '^[a-zA-Z0-9_.@-]+$') { throw 'Invalid SSH host name.' }
 
 function Invoke-Checked {
-    param([string]$Program, [Parameter(ValueFromRemainingArguments=$true)][string[]]$Arguments)
+    param([string]$Program, [string[]]$Arguments)
     & $Program @Arguments
     if ($LASTEXITCODE -ne 0) { throw "$Program failed with exit code $LASTEXITCODE" }
 }
@@ -32,7 +32,7 @@ function Get-Commit {
 }
 
 if ($Action -in @('Status', 'Rollback')) {
-    Invoke-Checked ssh @('-t', $Server, "sudo /usr/local/lib/olli-deploy/schema.py $($Action.ToLowerInvariant())")
+    Invoke-Checked -Program ssh -Arguments @('-t', $Server, "sudo /usr/local/lib/olli-deploy/schema.py $($Action.ToLowerInvariant())")
     return
 }
 
@@ -63,12 +63,12 @@ if (-not $ReleaseDirectory) {
         $javaDetails = Get-Content -LiteralPath (Join-Path $JavaHome 'release') -Raw
         if ($javaDetails -notmatch 'JAVA_VERSION="21\.') { throw 'This deployment requires JDK 21.' }
         Write-Host "Release: $release; source: $sourceCommit; EventCore: $coreCommit"
-        Invoke-Checked docker @('info', '--format', '{{.ServerVersion}}')
+        Invoke-Checked -Program docker -Arguments @('info', '--format', '{{.ServerVersion}}')
         Push-Location $eventCore
-        try { Invoke-Checked sbt @('test', 'publishAll') } finally { Pop-Location }
+        try { Invoke-Checked -Program sbt -Arguments @('test', 'publishAll') } finally { Pop-Location }
         Push-Location $repository
         try {
-            Invoke-Checked sbt @("-Dolli.build.version=$release", "-Dolli.source.commit=$sourceCommit", "-Dolli.eventcore.commit=$coreCommit", 'test', 'Docker/publishLocal')
+            Invoke-Checked -Program sbt -Arguments @("-Dolli.build.version=$release", "-Dolli.source.commit=$sourceCommit", "-Dolli.eventcore.commit=$coreCommit", 'test', 'Docker/publishLocal')
         } finally { Pop-Location }
         # A source edit during the build invalidates provenance.
         if ((Get-Commit $repository) -ne $sourceCommit -or (Get-Commit $eventCore) -ne $coreCommit) {
@@ -80,7 +80,7 @@ if (-not $ReleaseDirectory) {
         if ($imageInfo.Config.Labels.'org.opencontainers.image.revision' -ne $sourceCommit) { throw 'Image provenance label missing.' }
         $plain = Join-Path $ReleaseDirectory 'image.tar'
         $compressed = Join-Path $ReleaseDirectory 'image.tar.gz'
-        Invoke-Checked docker @('save', '--output', $plain, $image)
+        Invoke-Checked -Program docker -Arguments @('save', '--output', $plain, $image)
         $inputStream = [IO.File]::OpenRead($plain)
         $outputStream = [IO.File]::Create($compressed)
         $gzip = New-Object IO.Compression.GZipStream($outputStream, [IO.Compression.CompressionLevel]::Optimal)
@@ -111,8 +111,8 @@ if ((Get-FileHash -LiteralPath $archive).Hash.ToLowerInvariant() -ne $manifest.a
 Write-Host "Release ready: $ReleaseDirectory"
 if ($Action -eq 'Build') { return }
 
-Invoke-Checked ssh @($Server, "mkdir -p /srv/olli/incoming/schema/$release")
-Invoke-Checked scp @($archive, $manifestPath, "${Server}:/srv/olli/incoming/schema/$release/")
+Invoke-Checked -Program ssh -Arguments @($Server, "mkdir -p /srv/olli/incoming/schema/$release")
+Invoke-Checked -Program scp -Arguments @($archive, $manifestPath, "${Server}:/srv/olli/incoming/schema/$release/")
 # Interactive SSH/sudo is deliberate: no password storage and no blanket passwordless sudo.
 $deploymentLog = Join-Path $ReleaseDirectory 'deployment.log'
 "Started $((Get-Date).ToUniversalTime().ToString('o')) release=$release server=$Server" | Set-Content -LiteralPath $deploymentLog
