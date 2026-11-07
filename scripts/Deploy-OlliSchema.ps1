@@ -114,7 +114,11 @@ if ($Action -eq 'Build') { return }
 Invoke-Checked ssh @($Server, "mkdir -p /srv/olli/incoming/schema/$release")
 Invoke-Checked scp @($archive, $manifestPath, "${Server}:/srv/olli/incoming/schema/$release/")
 # Interactive SSH/sudo is deliberate: no password storage and no blanket passwordless sudo.
-& ssh -t $Server "sudo /usr/local/lib/olli-deploy/schema.py apply $release" | Tee-Object -FilePath (Join-Path $ReleaseDirectory 'deployment.log') | Write-Output
+$deploymentLog = Join-Path $ReleaseDirectory 'deployment.log'
+"Started $((Get-Date).ToUniversalTime().ToString('o')) release=$release server=$Server" | Set-Content -LiteralPath $deploymentLog
+# Keep the native console attached: line-buffered pipelines hide sudo's prompt (no newline).
+& ssh -t $Server "sudo /usr/local/lib/olli-deploy/schema.py apply $release"
 $remoteExit = $LASTEXITCODE
+"Finished $((Get-Date).ToUniversalTime().ToString('o')) exit=$remoteExit" | Add-Content -LiteralPath $deploymentLog
 if ($remoteExit -ne 0) { throw "Remote deployment failed with exit code $remoteExit. Inspect deployment.log." }
 Write-Host "Deployment completed: $release"

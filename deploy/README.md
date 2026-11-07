@@ -69,8 +69,9 @@ archiviert auf HDD, lädt das Image und prüft beim Start HTTP-Readiness statt n
 Eine Release-ID wird nicht überschrieben. Bei Abbruch Zustand/Logs prüfen und nicht dieselbe
 teilweise angelegte Release-ID blind erneut verwenden.
 
-Die Terminalausgabe wird lokal als `deployment.log` gespeichert. Serverseitige
-Docker-Befehlsausgaben werden zusätzlich im Releaseordner protokolliert.
+Startzeit, Release und Exitcode werden lokal als `deployment.log` gespeichert.
+Die SSH-Ausgabe bleibt direkt am Terminal, damit Passwortabfragen sichtbar bleiben.
+Serverseitige Docker-Befehlsausgaben werden im Releaseordner protokolliert.
 Anmeldedaten werden nicht im Skript hinterlegt. SSH-/sudo-Anmeldung ist weiterhin nötig;
 für weniger Passphrase-Abfragen kann später ein SSH-Agent eingerichtet werden.
 
