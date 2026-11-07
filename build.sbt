@@ -1,5 +1,5 @@
 ThisBuild / organization := "de.bizgrid"
-ThisBuild / version := "0.1.0-SNAPSHOT"
+ThisBuild / version := sys.props.getOrElse("olli.build.version", "0.1.0-SNAPSHOT")
 ThisBuild / scalaVersion := "3.6.2"
 
 lazy val pekkoVersion = "1.6.0"
@@ -47,6 +47,11 @@ lazy val root = project.in(file("."))
     maintainer := "bizGrid",
     dockerBaseImage := "eclipse-temurin:21-jre-jammy",
     dockerExposedPorts := Seq(8110),
-    dockerUpdateLatest := true,
+    dockerUpdateLatest := !sys.props.contains("olli.build.version"),
+    dockerLabels ++= Seq(
+      "olli.source.commit" -> "org.opencontainers.image.revision",
+      "olli.eventcore.commit" -> "de.bizgrid.eventcore.revision",
+      "olli.build.version" -> "de.bizgrid.release"
+    ).flatMap { case (property, label) => sys.props.get(property).map(label -> _) }.toMap,
     Universal / javaOptions ++= Seq("-J-Xms256m", "-J-Xmx1g", "-Dfile.encoding=UTF-8")
   )

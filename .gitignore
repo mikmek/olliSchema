@@ -3,6 +3,8 @@ project/target/
 project/project/
 .bsp/
 .metals/
+__pycache__/
+*.pyc
 data/
 
 # Externe Laufzeitkonfiguration; versioniert sind nur die Vorlagen.
