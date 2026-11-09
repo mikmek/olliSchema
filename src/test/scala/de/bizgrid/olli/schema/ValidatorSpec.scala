@@ -9,6 +9,9 @@ import scala.concurrent.duration.*
 
 class ValidatorSpec extends AnyFunSuite with Matchers {
   private val support = new JsonSchemaSupport(100.millis)
+  private def farDeadline: Long = System.nanoTime() + 60.seconds.toNanos
+  private def budget(keep: Int = 10, count: Int = 1000, time: FiniteDuration = 60.seconds) =
+    ValidationBudget(keep, count, System.nanoTime() + time.toNanos)
 
   test("never touches the network: an unknown absolute reference does not compile (REQ-SCH-016)") {
     val requested = scala.collection.mutable.Buffer[String]()
@@ -22,7 +25,7 @@ class ValidatorSpec extends AnyFunSuite with Matchers {
     val local = Map("https://bizgrid.de/ollischema/a/common/name-v1.json" -> ujson.Obj("type" -> "string", "minLength" -> 2))
     val compiled = support.compile("https://bizgrid.de/ollischema/a/b/c-v1.json",
       ujson.Obj("properties" -> ujson.Obj("name" -> ujson.Obj("$ref" -> "../common/name-v1.json"))), local.get, cacheable = false)
-    val outcome = compiled.toOption.get.validate(ujson.Obj("name" -> "x"), 10)
+    val outcome = compiled.toOption.get.validate(ujson.Obj("name" -> "x"), budget())
     outcome.errorCount shouldBe 1
     outcome.errors.head.pointer shouldBe "/name"
     outcome.errors.head.keyword shouldBe "minLength"
@@ -30,17 +33,18 @@ class ValidatorSpec extends AnyFunSuite with Matchers {
 
   test("a catastrophic pattern ends with an error instead of blocking (ReDoS, ADR-0069)") {
     val compiled = support.compile("https://bizgrid.de/ollischema/a/b/redos-v1.json",
-      ujson.Obj("type" -> "string", "pattern" -> "^(a+)+$"), _ => None, cacheable = false).toOption.get
+      ujson.Obj("type" -> "string", "pattern" -> "^(.*a){20}$"), _ => None, cacheable = false).toOption.get
     val started = System.nanoTime()
-    val outcome = compiled.validate(ujson.Str("a" * 40 + "!"), 10)
+    val outcome = compiled.validate(ujson.Str("a" * 36 + "!"), budget())
     (System.nanoTime() - started).nanos should be < 5.seconds
     outcome.valid shouldBe false
-    outcome.errors.head.keyword shouldBe "pattern"
+    outcome.aborted.get should include("exceeded its time limit")
+    outcome.errors.head.keyword shouldBe ValidationOutcome.LimitKeyword
   }
 
   test("the metaschema check reports malformed keywords") {
-    support.checkDocument(ujson.Obj("type" -> "object", "properties" -> ujson.Obj("a" -> ujson.Obj("minLength" -> "two")))) should not be empty
-    support.checkDocument(ujson.Obj("type" -> "object")) shouldBe empty
+    support.checkDocument(ujson.Obj("type" -> "object", "properties" -> ujson.Obj("a" -> ujson.Obj("minLength" -> "two"))), farDeadline) should not be empty
+    support.checkDocument(ujson.Obj("type" -> "object"), farDeadline) shouldBe empty
   }
 
   test("decodes entity.events envelopes (ADR-0020, payload version 2)") {
@@ -67,7 +71,7 @@ class SelectorsSpec extends AnyFunSuite with Matchers {
     "$defs" -> ujson.Obj("room" -> ujson.Obj("properties" -> ujson.Obj("Area" -> ujson.Obj("type" -> "number")))))
 
   private def problems(expression: String, kind: Selector.Kind = Selector.Kind.JsonPath) =
-    Selectors.check(Seq(Selector(expression, "/x", kind)), "https://bizgrid.de/ollischema/a/b/c-v1.json", target, _ => None).map(_.code)
+    Selectors.check(Seq(Selector(expression, "/x", kind)), "https://bizgrid.de/ollischema/a/b/c-v1.json", target, _ => None, 200.millis).map(_.code)
 
   test("accepts declared properties through $ref, items, wildcards, filters and combinators") {
     problems("$.Name") shouldBe Nil

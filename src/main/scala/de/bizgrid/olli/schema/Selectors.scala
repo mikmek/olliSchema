@@ -1,5 +1,8 @@
 package de.bizgrid.olli.schema
 
+import java.util.regex.{Pattern, PatternSyntaxException}
+import scala.collection.mutable
+import scala.concurrent.duration.FiniteDuration
 import scala.util.Try
 
 /** Ein Selektor eines Meta-Schemas mit seiner Fundstelle im Meta-Schema-Dokument. */
@@ -9,25 +12,327 @@ object Selector {
   enum Kind { case JsonPath, JsonPointer }
 }
 
+/** In Filterausdruecken eingebettete Abfragen: relativ zum gefilterten Kind (`@`) oder zur Wurzel (`$`). */
+private[schema] final case class FilterQueries(relative: Seq[Seq[Step]], absolute: Seq[Seq[Step]])
+
 /** Ein Schritt eines Selektors, auf das Instanzmodell bezogen. */
 private[schema] enum Step {
   case Name(name: String)
+  /** Index eines Array-Elements; nur auf Arrays zulaessig. */
   case Index(index: Int)
-  /** `*`, Filter `[?…]` und Slices: irgendein Kind. */
-  case AnyChild
-  /** `..name`: irgendein Nachfahre mit diesem Namen. */
-  case Descendant(name: Option[String])
+  /** Slice `start:end:step`; nur auf Arrays zulaessig. */
+  case Slice
+  /** `*`: jedes Kind (Properties und Array-Elemente). */
+  case Wildcard
+  /** `[?…]`: Kinder, deren eingebettete Abfragen im Schema des Kindes bzw. der Wurzel existieren muessen. */
+  case Filter(queries: FilterQueries)
+  /** Mehrfachauswahl `[a,b]`: jedes Element muss fuer sich existieren. */
+  case Union(steps: Seq[Step])
+  /** `..x`: der Selektor `x` auf den Knoten und alle Nachfahren. */
+  case Descendant(inner: Step)
   /** JSON-Pointer-Segment, das Name oder Index sein kann. */
   case NameOrIndex(segment: String)
+}
+
+/**
+ * Parser fuer JSONPath nach RFC 9535. Unzulaessige Konstrukte werden abgelehnt und nie zu einer
+ * Wildcard verbreitert (SCH-A05). Filterausdruecke werden vollstaendig geparst: logische und
+ * Vergleichsoperatoren, Literale, eingebettete Abfragen und die Funktionen der Spezifikation (`length`,
+ * `count`, `match`, `search`, `value`) mit Stelligkeit und Grundtypen.
+ */
+private[schema] final class JsonPathParser(text: String) {
+  private var pos = 0
+
+  final class ParseError(message: String) extends RuntimeException(message, null, false, false)
+
+  private def fail(message: String): Nothing = throw new ParseError(s"$message at position $pos")
+  private def peek: Char = if (pos < text.length) text(pos) else '\u0000'
+  private def atEnd: Boolean = pos >= text.length
+  private def startsWith(token: String): Boolean = text.startsWith(token, pos)
+  private def expect(token: String): Unit = if (startsWith(token)) pos += token.length else fail(s"Expected '$token'")
+  private def blanks(): Unit = while (!atEnd && " \t\n\r".contains(peek)) pos += 1
+
+  def parseQuery(): Either[String, Seq[Step]] =
+    try {
+      expect("$")
+      val steps = segments()
+      if (!atEnd) fail(s"Unexpected '$peek'")
+      Right(steps)
+    } catch { case error: ParseError => Left(error.getMessage) }
+
+  /** Segmente bis zu einem Zeichen, das kein Segment beginnt; Leerraum zwischen Segmenten ist erlaubt. */
+  private def segments(): Seq[Step] = {
+    val steps = Seq.newBuilder[Step]
+    var continue = true
+    while (continue) {
+      val mark = pos
+      blanks()
+      if (startsWith("..")) {
+        pos += 2
+        steps += Step.Descendant(
+          if (peek == '[') bracketed()
+          else if (peek == '*') { pos += 1; Step.Wildcard }
+          else Step.Name(memberName()))
+      } else if (peek == '.') {
+        pos += 1
+        steps += (if (peek == '*') { pos += 1; Step.Wildcard } else Step.Name(memberName()))
+      } else if (peek == '[') steps += bracketed()
+      else { pos = mark; continue = false }
+    }
+    steps.result()
+  }
+
+  private def isNameFirst(c: Char): Boolean = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c >= 0x80
+  private def isNameChar(c: Char): Boolean = isNameFirst(c) || (c >= '0' && c <= '9')
+
+  private def memberName(): String = {
+    if (atEnd || !isNameFirst(peek)) fail("Expected a member name")
+    val start = pos
+    while (!atEnd && isNameChar(peek)) pos += 1
+    text.substring(start, pos)
+  }
+
+  private def bracketed(): Step = {
+    expect("[")
+    blanks()
+    val selectors = mutable.ArrayBuffer(selector())
+    blanks()
+    while (peek == ',') {
+      pos += 1
+      blanks()
+      selectors += selector()
+      blanks()
+    }
+    expect("]")
+    if (selectors.size == 1) selectors.head else Step.Union(selectors.toSeq)
+  }
+
+  private def selector(): Step = peek match {
+    case '\'' | '"' => Step.Name(stringLiteral())
+    case '*' => pos += 1; Step.Wildcard
+    case '?' =>
+      pos += 1
+      blanks()
+      val queries = mutable.ArrayBuffer.empty[FilterQueries]
+      logicalExpr(queries)
+      Step.Filter(FilterQueries(queries.flatMap(_.relative).toSeq, queries.flatMap(_.absolute).toSeq))
+    case c if c == ':' || c == '-' || c.isDigit => indexOrSlice()
+    case other => fail(s"Unsupported selector starting with '$other'")
+  }
+
+  private def integer(): Option[Long] = {
+    val start = pos
+    if (peek == '-') pos += 1
+    if (peek == '0') {
+      pos += 1
+      if (text.substring(start, pos) == "-0") fail("'-0' is not a valid index")
+    } else if (peek >= '1' && peek <= '9') while (peek.isDigit) pos += 1
+    else { pos = start; return None }
+    text.substring(start, pos).toLongOption.orElse(fail("Index out of range"))
+  }
+
+  private def indexOrSlice(): Step = {
+    val start = integer()
+    blanks()
+    if (peek != ':') start match {
+      case Some(value) if value.isValidInt => Step.Index(value.toInt)
+      case Some(_) => fail("Index out of range")
+      case None => fail("Expected an index or a slice")
+    } else {
+      pos += 1
+      blanks()
+      integer()
+      blanks()
+      if (peek == ':') {
+        pos += 1
+        blanks()
+        integer()
+      }
+      Step.Slice
+    }
+  }
+
+  private def stringLiteral(): String = {
+    val quote = peek
+    pos += 1
+    val out = new StringBuilder
+    while (peek != quote) {
+      if (atEnd) fail("Unterminated string literal")
+      val c = peek
+      if (c < 0x20) fail("Control character in string literal")
+      if (c == '\\') {
+        pos += 1
+        peek match {
+          case 'b' => out += '\b'; pos += 1
+          case 'f' => out += '\f'; pos += 1
+          case 'n' => out += '\n'; pos += 1
+          case 'r' => out += '\r'; pos += 1
+          case 't' => out += '\t'; pos += 1
+          case '/' => out += '/'; pos += 1
+          case '\\' => out += '\\'; pos += 1
+          case 'u' =>
+            pos += 1
+            val hex = if (pos + 4 <= text.length) text.substring(pos, pos + 4) else ""
+            if (!hex.matches("[0-9a-fA-F]{4}")) fail("Invalid unicode escape")
+            out += Integer.parseInt(hex, 16).toChar
+            pos += 4
+          case q if q == quote => out += q; pos += 1
+          case other => fail(s"Invalid escape '\\$other'")
+        }
+      } else { out += c; pos += 1 }
+    }
+    pos += 1
+    out.result()
+  }
+
+  // ---- Filterausdruecke -------------------------------------------------------------------------
+
+  /** Grundtypen nach RFC 9535 Abschnitt 2.4.1. */
+  private enum Kind { case Value, Logical, Nodes, SingularNodes, Literal }
+
+  private def logicalExpr(queries: mutable.ArrayBuffer[FilterQueries]): Unit = {
+    andExpr(queries)
+    blanks()
+    while (startsWith("||")) { pos += 2; blanks(); andExpr(queries); blanks() }
+  }
+
+  private def andExpr(queries: mutable.ArrayBuffer[FilterQueries]): Unit = {
+    basicExpr(queries)
+    blanks()
+    while (startsWith("&&")) { pos += 2; blanks(); basicExpr(queries); blanks() }
+  }
+
+  private val ComparisonOps = Seq("==", "!=", "<=", ">=", "<", ">")
+
+  private def basicExpr(queries: mutable.ArrayBuffer[FilterQueries]): Unit = {
+    val negated = peek == '!' && !startsWith("!=")
+    if (negated) { pos += 1; blanks() }
+    if (peek == '(') {
+      pos += 1
+      blanks()
+      logicalExpr(queries)
+      blanks()
+      expect(")")
+    } else {
+      val left = operand(queries)
+      blanks()
+      ComparisonOps.find(startsWith) match {
+        case Some(op) =>
+          if (negated) fail("'!' cannot negate a comparison without parentheses")
+          requireComparable(left)
+          pos += op.length
+          blanks()
+          requireComparable(operand(queries))
+        case None =>
+          left match {
+            case Kind.Nodes | Kind.SingularNodes | Kind.Logical => ()
+            case _ => fail("Expected a comparison or a test expression")
+          }
+      }
+    }
+  }
+
+  private def requireComparable(kind: Kind): Unit = kind match {
+    case Kind.Literal | Kind.SingularNodes | Kind.Value => ()
+    case _ => fail("Operand is not comparable (use a literal, a singular query or a value function)")
+  }
+
+  private def operand(queries: mutable.ArrayBuffer[FilterQueries]): Kind = peek match {
+    case '@' =>
+      pos += 1
+      val steps = segments()
+      queries += FilterQueries(Seq(steps), Nil)
+      if (singular(steps)) Kind.SingularNodes else Kind.Nodes
+    case '$' =>
+      pos += 1
+      val steps = segments()
+      queries += FilterQueries(Nil, Seq(steps))
+      if (singular(steps)) Kind.SingularNodes else Kind.Nodes
+    case '\'' | '"' => stringLiteral(); Kind.Literal
+    case c if c == '-' || c.isDigit => number(); Kind.Literal
+    case _ if startsWith("true") && !nameContinues(4) => pos += 4; Kind.Literal
+    case _ if startsWith("false") && !nameContinues(5) => pos += 5; Kind.Literal
+    case _ if startsWith("null") && !nameContinues(4) => pos += 4; Kind.Literal
+    case c if c >= 'a' && c <= 'z' => function(queries)
+    case other => fail(s"Unexpected '$other' in filter expression")
+  }
+
+  private def nameContinues(offset: Int): Boolean = pos + offset < text.length && {
+    val c = text(pos + offset)
+    c.isLetterOrDigit || c == '_'
+  }
+
+  private def singular(steps: Seq[Step]): Boolean = steps.forall {
+    case Step.Name(_) | Step.Index(_) => true
+    case _ => false
+  }
+
+  private def number(): Unit = {
+    val start = pos
+    if (peek == '-') pos += 1
+    if (peek == '0') pos += 1
+    else if (peek >= '1' && peek <= '9') while (peek.isDigit) pos += 1
+    else fail("Invalid number")
+    if (peek == '.') {
+      pos += 1
+      if (!peek.isDigit) fail("Invalid fraction")
+      while (peek.isDigit) pos += 1
+    }
+    if (peek == 'e' || peek == 'E') {
+      pos += 1
+      if (peek == '+' || peek == '-') pos += 1
+      if (!peek.isDigit) fail("Invalid exponent")
+      while (peek.isDigit) pos += 1
+    }
+    if (pos == start) fail("Invalid number")
+  }
+
+  /** Funktionen der Spezifikation: Name -> (Argumenttypen, Ergebnistyp). */
+  private val Functions: Map[String, (Seq[Kind], Kind)] = Map(
+    "length" -> (Seq(Kind.Value), Kind.Value),
+    "count" -> (Seq(Kind.Nodes), Kind.Value),
+    "value" -> (Seq(Kind.Nodes), Kind.Value),
+    "match" -> (Seq(Kind.Value, Kind.Value), Kind.Logical),
+    "search" -> (Seq(Kind.Value, Kind.Value), Kind.Logical))
+
+  private def function(queries: mutable.ArrayBuffer[FilterQueries]): Kind = {
+    val start = pos
+    while (!atEnd && ((peek >= 'a' && peek <= 'z') || peek.isDigit || peek == '_')) pos += 1
+    val name = text.substring(start, pos)
+    val (parameters, result) = Functions.getOrElse(name, fail(s"Unknown function '$name'"))
+    expect("(")
+    blanks()
+    val arguments = mutable.ArrayBuffer.empty[Kind]
+    if (peek != ')') {
+      arguments += argument(queries)
+      blanks()
+      while (peek == ',') { pos += 1; blanks(); arguments += argument(queries); blanks() }
+    }
+    expect(")")
+    if (arguments.size != parameters.size) fail(s"Function '$name' expects ${parameters.size} argument(s)")
+    parameters.zip(arguments).foreach { (expected, actual) =>
+      val ok = expected match {
+        case Kind.Value => actual == Kind.Value || actual == Kind.Literal || actual == Kind.SingularNodes
+        case Kind.Nodes => actual == Kind.Nodes || actual == Kind.SingularNodes
+        case _ => true
+      }
+      if (!ok) fail(s"Argument of '$name' has the wrong type")
+    }
+    result
+  }
+
+  private def argument(queries: mutable.ArrayBuffer[FilterQueries]): Kind = operand(queries)
 }
 
 /**
  * Selektoren der Meta-Schemas (ADR-0065): JSONPath nach RFC 9535 fuer Selektionen mit Wildcards und
  * Filtern, JSON Pointer nach RFC 6901 fuer konkrete Orte.
  *
- * Geprueft wird nur, ob ein Selektor im Zielschema existieren kann: jeder benannte Schritt muss in
+ * Geprueft wird, ob ein Selektor im Zielschema existieren kann: jeder benannte Schritt muss in
  * `properties` (oder passend in `patternProperties` bzw. einem Schema unter `additionalProperties`)
- * deklariert sein. Filterausdruecke werden nicht ausgewertet, sie selektieren Kinder.
+ * deklariert sein, Index und Slice verlangen ein Array, jedes Element einer Mehrfachauswahl wird einzeln
+ * geprueft, und die in Filtern eingebetteten Abfragen muessen im Schema der gefilterten Kinder bzw. der
+ * Wurzel existieren. `patternProperties` werden mit Zeitgrenze ausgewertet (SCH-A06).
  */
 object Selectors {
   private val WholePath = "^\\$(?:[.\\[].*)?$".r
@@ -54,121 +359,25 @@ object Selectors {
   }
 
   /** Zerlegt einen JSONPath (RFC 9535) in Schritte. */
-  def parseJsonPath(expression: String): Either[String, Seq[Step]] = {
-    val text = expression.trim
-    if (!text.startsWith("$")) return Left("JSONPath must start with '$'")
-    val steps = Seq.newBuilder[Step]
-    var index = 1
-    def name(start: Int): (String, Int) = {
-      var end = start
-      while (end < text.length && (text(end).isLetterOrDigit || text(end) == '_' || text(end) > 0x7f)) end += 1
-      (text.substring(start, end), end)
-    }
-    while (index < text.length) {
-      text(index) match {
-        case '.' if text.startsWith("..", index) =>
-          if (text.startsWith("..*", index)) { steps += Step.Descendant(None); index += 3 }
-          else if (text.startsWith("..[", index)) {
-            bracket(text, index + 2) match {
-              case Left(problem) => return Left(problem)
-              case Right((selectors, next)) =>
-                steps += Step.Descendant(selectors.collectFirst { case Step.Name(value) => value })
-                index = next
-            }
-          } else {
-            val (value, next) = name(index + 2)
-            if (value.isEmpty) return Left(s"Expected a member name at position ${index + 2}")
-            steps += Step.Descendant(Some(value)); index = next
-          }
-        case '.' =>
-          if (text.startsWith(".*", index)) { steps += Step.AnyChild; index += 2 }
-          else {
-            val (value, next) = name(index + 1)
-            if (value.isEmpty) return Left(s"Expected a member name at position ${index + 1}")
-            steps += Step.Name(value); index = next
-          }
-        case '[' =>
-          bracket(text, index) match {
-            case Left(problem) => return Left(problem)
-            case Right((selectors, next)) =>
-              steps += (if (selectors.size == 1) selectors.head else Step.AnyChild)
-              index = next
-          }
-        case other => return Left(s"Unexpected '$other' at position $index")
-      }
-    }
-    Right(steps.result())
-  }
-
-  /** Liest einen Klammerselektor ab `start` (zeigt auf '['). */
-  private def bracket(text: String, start: Int): Either[String, (Seq[Step], Int)] = {
-    var depth = 0
-    var quote: Option[Char] = None
-    var end = start
-    var done = false
-    while (!done && end < text.length) {
-      val c = text(end)
-      quote match {
-        case Some(q) => if (c == '\\') end += 1 else if (c == q) quote = None
-        case None =>
-          if (c == '\'' || c == '"') quote = Some(c)
-          else if (c == '[') depth += 1
-          else if (c == ']') { depth -= 1; if (depth == 0) done = true }
-      }
-      if (!done) end += 1
-    }
-    if (!done) Left(s"Unclosed '[' at position $start")
-    else {
-      val inner = text.substring(start + 1, end).trim
-      val parsed: Seq[Either[String, Step]] =
-        if (inner.startsWith("?")) Seq(Right(Step.AnyChild))
-        else splitTopLevel(inner).map(part => selector(part.trim))
-      parsed.collectFirst { case Left(problem) => problem } match {
-        case Some(problem) => Left(problem)
-        case None => Right((parsed.collect { case Right(step) => step }, end + 1))
-      }
-    }
-  }
-
-  private def selector(value: String): Either[String, Step] = {
-    def quoted(q: Char) = value.length >= 2 && value.head == q && value.last == q
-    if (value == "*") Right(Step.AnyChild)
-    else if (quoted('\'') || quoted('"'))
-      Right(Step.Name(value.substring(1, value.length - 1).replace("\\'", "'").replace("\\\"", "\"")))
-    else value.toIntOption match {
-      case Some(number) => Right(Step.Index(number))
-      case None if value.contains(':') => Right(Step.AnyChild)
-      case None => Left(s"Unsupported selector '$value'")
-    }
-  }
-
-  private def splitTopLevel(text: String): Seq[String] = {
-    val parts = Seq.newBuilder[String]
-    var quote: Option[Char] = None
-    var from = 0
-    text.indices.foreach { index =>
-      val c = text(index)
-      quote match {
-        case Some(q) => if (c == q) quote = None
-        case None =>
-          if (c == '\'' || c == '"') quote = Some(c)
-          else if (c == ',') { parts += text.substring(from, index); from = index + 1 }
-      }
-    }
-    parts += text.substring(from)
-    parts.result()
-  }
+  def parseJsonPath(expression: String): Either[String, Seq[Step]] = new JsonPathParser(expression.trim).parseQuery()
 
   def parseJsonPointer(pointer: String): Either[String, Seq[Step]] =
     if (pointer.isEmpty) Right(Nil)
     else if (!pointer.startsWith("/")) Left("JSON Pointer must be empty or start with '/'")
-    else Right(pointer.drop(1).split("/", -1).toSeq.map(segment => Step.NameOrIndex(segment.replace("~1", "/").replace("~0", "~"))))
+    else {
+      val segments = pointer.drop(1).split("/", -1).toSeq
+      segments.find(segment => "~(?![01])".r.findFirstIn(segment).nonEmpty) match {
+        case Some(segment) => Left(s"Invalid escape in segment '$segment'")
+        case None => Right(segments.map(segment => Step.NameOrIndex(segment.replace("~1", "/").replace("~0", "~"))))
+      }
+    }
 
   /**
    * Prueft alle Selektoren gegen das Zielschema. `resolve` liefert referenzierte Dokumente aus der
    * lokalen Registry.
    */
-  def check(selectors: Seq[Selector], targetUrl: String, target: ujson.Value, resolve: String => Option[ujson.Value]): Seq[Problem] =
+  def check(selectors: Seq[Selector], targetUrl: String, target: ujson.Value, resolve: String => Option[ujson.Value],
+            regexTimeout: FiniteDuration): Seq[Problem] =
     selectors.flatMap { selector =>
       val steps = selector.kind match {
         case Selector.Kind.JsonPath => parseJsonPath(selector.expression)
@@ -177,38 +386,81 @@ object Selectors {
       steps match {
         case Left(problem) => Seq(Problem("invalid-selector", s"${selector.expression}: $problem", Some(selector.location)))
         case Right(parsed) =>
-          new Navigator(resolve).missing(SchemaNode(targetUrl, target, target), parsed) match {
-            case None => Nil
-            case Some(reason) => Seq(Problem("unknown-selector", s"${selector.expression}: $reason", Some(selector.location)))
-          }
+          val navigator = new Navigator(resolve, regexTimeout)
+          val root = SchemaNode(targetUrl, target, target)
+          val missing = navigator.missing(root, root, parsed).map(reason =>
+            Problem("unknown-selector", s"${selector.expression}: $reason", Some(selector.location)))
+          val timeouts = navigator.regexTimeouts.distinct.map(pattern =>
+            Problem("selector-regex-timeout", s"${selector.expression}: patternProperties '$pattern' exceeded its time limit", Some(selector.location)))
+          missing.toSeq ++ timeouts
       }
     }
 
   private final case class SchemaNode(documentUrl: String, root: ujson.Value, node: ujson.Value)
 
-  private final class Navigator(resolve: String => Option[ujson.Value]) {
+  private final class Navigator(resolve: String => Option[ujson.Value], regexTimeout: FiniteDuration) {
     private var visited = 0
+    val regexTimeouts = mutable.ArrayBuffer.empty[String]
 
     /** Liefert den Grund, falls der Pfad im Schema nicht existieren kann. */
-    def missing(start: SchemaNode, steps: Seq[Step]): Option[String] = {
-      var current = Seq(start)
-      var problem: Option[String] = None
-      val remaining = steps.iterator
-      while (problem.isEmpty && remaining.hasNext) {
-        val step = remaining.next()
-        val next = current.flatMap(expand).flatMap(node => children(node, step)).distinct
-        if (next.isEmpty) problem = Some(s"${describe(step)} is not declared in the target schema")
-        current = next
+    def missing(root: SchemaNode, start: SchemaNode, steps: Seq[Step]): Option[String] =
+      walk(root, Seq(start), steps).left.toOption
+
+    private def walk(root: SchemaNode, start: Seq[SchemaNode], steps: Seq[Step]): Either[String, Seq[SchemaNode]] =
+      steps.foldLeft[Either[String, Seq[SchemaNode]]](Right(start)) { (current, step) =>
+        current.flatMap(nodes => apply(root, nodes.flatMap(expand), step))
       }
-      problem
+
+    private def apply(root: SchemaNode, nodes: Seq[SchemaNode], step: Step): Either[String, Seq[SchemaNode]] = step match {
+      case Step.Union(members) =>
+        members.foldLeft[Either[String, Seq[SchemaNode]]](Right(Nil)) { (acc, member) =>
+          acc.flatMap(found => apply(root, nodes, member).map(found ++ _))
+        }.map(_.distinct)
+      case Step.Descendant(inner) =>
+        val all = descendants(nodes)
+        inner match {
+          case Step.Union(members) =>
+            members.foldLeft[Either[String, Seq[SchemaNode]]](Right(Nil)) { (acc, member) =>
+              acc.flatMap(found => apply(root, all, member).map(found ++ _))
+            }.left.map(reason => s"descendant: $reason")
+          case other => apply(root, all, other).left.map(reason => s"descendant: $reason")
+        }
+      case Step.Filter(queries) =>
+        val candidates = nodes.flatMap(children(_, Step.Wildcard)).distinct
+        if (candidates.isEmpty) Left("filter selection has no children in the target schema")
+        else {
+          val relative = queries.relative.map(path => (path, walk(root, candidates, path)))
+          val absolute = queries.absolute.map(path => (path, walk(root, Seq(root), path)))
+          (relative ++ absolute).collectFirst { case (_, Left(reason)) => s"filter query: $reason" } match {
+            case Some(reason) => Left(reason)
+            case None => Right(candidates)
+          }
+        }
+      case simple =>
+        val next = nodes.flatMap(children(_, simple)).distinct
+        if (next.isEmpty) Left(s"${describe(simple)} is not declared in the target schema") else Right(next)
     }
 
     private def describe(step: Step): String = step match {
       case Step.Name(name) => s"property '$name'"
-      case Step.Index(index) => s"item [$index]"
-      case Step.AnyChild => "child selection"
-      case Step.Descendant(name) => name.fold("descendant selection")(value => s"descendant '$value'")
+      case Step.Index(index) => s"array item [$index]"
+      case Step.Slice => "array slice"
+      case Step.Wildcard => "child selection"
       case Step.NameOrIndex(segment) => s"location '$segment'"
+      case other => other.toString
+    }
+
+    private def descendants(nodes: Seq[SchemaNode]): Seq[SchemaNode] = {
+      val result = mutable.LinkedHashSet.empty[SchemaNode]
+      var frontier = nodes
+      var depth = 0
+      while (frontier.nonEmpty && depth < 16 && visited < MaxNodes) {
+        val fresh = frontier.flatMap(expand).filterNot(result.contains)
+        result ++= fresh
+        frontier = fresh.flatMap(children(_, Step.Wildcard))
+        depth += 1
+      }
+      result.toSeq
     }
 
     /** Ein Knoten zusammen mit allem, was ueber $ref und Kombinatoren zu ihm gehoert. */
@@ -251,43 +503,38 @@ object Selectors {
       case _ => None
     }
 
+    private def matches(pattern: String, name: String): Boolean =
+      try SafeRegex.find(Pattern.compile(pattern), name, regexTimeout)
+      catch {
+        case _: RegexTimeoutException => regexTimeouts += pattern; false
+        case _: PatternSyntaxException => false
+      }
+
     private def children(node: SchemaNode, step: Step): Seq[SchemaNode] = {
       val obj = node.node.objOpt
       def child(value: ujson.Value) = node.copy(node = value)
       def properties = obj.flatMap(_.get("properties")).flatMap(_.objOpt).fold(Seq.empty[(String, ujson.Value)])(_.toSeq)
+      def patternProperties = obj.flatMap(_.get("patternProperties")).flatMap(_.objOpt).fold(Seq.empty[(String, ujson.Value)])(_.toSeq)
       def additional = obj.flatMap(_.get("additionalProperties")).filter(_.objOpt.nonEmpty).toSeq
-      def items = obj.toSeq.flatMap(o => o.get("items").toSeq ++ o.get("prefixItems").flatMap(_.arrOpt).toSeq.flatten)
+      def prefixItems = obj.flatMap(_.get("prefixItems")).flatMap(_.arrOpt).fold(Seq.empty[ujson.Value])(_.toSeq)
+      def items = obj.flatMap(_.get("items")).filter(value => value.objOpt.nonEmpty || value == ujson.True).toSeq
       def named(name: String): Seq[SchemaNode] = {
         val declared = properties.collect { case (key, value) if key == name => value }
-        val patterned = obj.flatMap(_.get("patternProperties")).flatMap(_.objOpt).toSeq.flatMap(_.toSeq).collect {
-          case (pattern, value) if Try(pattern.r.findFirstIn(name).nonEmpty).getOrElse(false) => value
-        }
+        val patterned = patternProperties.collect { case (pattern, value) if matches(pattern, name) => value }
         (declared ++ patterned ++ (if (declared.isEmpty && patterned.isEmpty) additional else Nil)).map(child)
       }
-      def indexed(index: Int): Seq[SchemaNode] = obj.toSeq.flatMap { o =>
-        val prefix = o.get("prefixItems").flatMap(_.arrOpt).flatMap(arr => arr.lift(index)).toSeq
-        if (prefix.nonEmpty) prefix else o.get("items").toSeq
-      }.map(child)
+      def indexed(index: Int): Seq[SchemaNode] =
+        (if (index >= 0 && index < prefixItems.size) Seq(prefixItems(index))
+         else if (index < 0) prefixItems ++ items
+         else items).map(child)
       step match {
         case Step.Name(name) => named(name)
         case Step.Index(index) => indexed(index)
-        case Step.NameOrIndex(segment) => named(segment) ++ segment.toIntOption.toSeq.flatMap(indexed)
-        case Step.AnyChild => (properties.map(_._2) ++ additional ++ items).map(child)
-        case Step.Descendant(name) =>
-          val all = Seq.newBuilder[SchemaNode]
-          def descend(current: SchemaNode, depth: Int): Unit = if (depth < 16 && visited < MaxNodes) {
-            expand(current).foreach { expanded =>
-              val direct = name.fold(children(expanded, Step.AnyChild))(value => children(expanded, Step.Name(value)).filter(_ => hasDeclared(expanded, value)))
-              all ++= direct
-              children(expanded, Step.AnyChild).foreach(descend(_, depth + 1))
-            }
-          }
-          descend(node, 0)
-          all.result()
+        case Step.Slice => (prefixItems ++ items).map(child)
+        case Step.NameOrIndex(segment) => named(segment) ++ segment.toIntOption.filter(_ >= 0).toSeq.flatMap(indexed)
+        case Step.Wildcard => (properties.map(_._2) ++ patternProperties.map(_._2) ++ additional ++ prefixItems ++ items).map(child)
+        case _ => Nil
       }
     }
-
-    private def hasDeclared(node: SchemaNode, name: String): Boolean =
-      node.node.objOpt.flatMap(_.get("properties")).flatMap(_.objOpt).exists(_.contains(name))
   }
 }

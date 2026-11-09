@@ -9,14 +9,19 @@ final case class Limits(
   storedErrors: Int,
   maxErrors: Int,
   maxDocumentBytes: Int,
+  maxInstanceBytes: Int,
   maxReferenceDepth: Int,
   maxReferencedSchemas: Int,
   regexTimeout: FiniteDuration,
+  maxValidationTime: FiniteDuration,
   compiledCacheSize: Int
 )
 
 /** Transitive Referenzziele eines Schemas, aufgeloest gegen die lokale Registry. */
 final case class Closure(records: Seq[SchemaRecord], missing: Seq[String], limitExceeded: Option[String])
+
+/** Warum eine Instanz nicht validiert werden konnte. */
+final case class NotValidated(state: EntityValidityState, detail: String)
 
 /** Ergebnis der Release-Pruefung (REQ-SCH-010), Grundlage des FSM-Guards. */
 final case class ReleaseCheck(
@@ -46,21 +51,45 @@ final case class ReleaseCheck(
 }
 
 /**
+ * Cache kompilierter Schemas, geteilt zwischen dem Checker auf dem Lesemodell und den Checkern auf den
+ * Transaktionssichten der Projektion. Nur Schemas, deren gesamte Referenzhuelle unveraenderlich ist,
+ * werden gecacht (ADR-0059); ihr Schluessel enthaelt den ETag.
+ */
+final class CompiledCache(maxEntries: Int) {
+  private val entries = new CompiledCache.Lru(maxEntries)
+  def get(key: String): Option[CompiledSchema] = entries.synchronized(Option(entries.get(key)))
+  def put(key: String, value: CompiledSchema): Unit = entries.synchronized(entries.put(key, value))
+  def size: Int = entries.synchronized(entries.size())
+}
+
+object CompiledCache {
+  private final class Lru(maxEntries: Int) extends java.util.LinkedHashMap[String, CompiledSchema](64, 0.75f, true) {
+    override def removeEldestEntry(eldest: java.util.Map.Entry[String, CompiledSchema]): Boolean = size() > maxEntries
+  }
+}
+
+/**
  * Schema-Gueltigkeit (ADR-0064), Release-Pruefung (REQ-SCH-010) und Entity-Validierung (REQ-SCH-008,
- * REQ-SCH-009). Zustandslos bis auf den Cache kompilierter Schemas: nur Schemas, deren gesamte
- * Referenzhuelle unveraenderlich ist, werden gecacht (ADR-0059).
+ * REQ-SCH-009). Zustandslos bis auf den Cache kompilierter Schemas.
+ *
+ * Ressourcenlimits (ADR-0069, SCH-A07): jede Instanz- und Metaschema-Validierung laeuft mit Frist
+ * (`maxValidationTime`) und bricht kooperativ ab, auch im Consumer und in der Neuvalidierung. Die
+ * Instanzgroesse ist begrenzt, die Referenzlimits gelten auch fuer die Entity-Validierung, und die
+ * Fehlersammlung endet an der Zaehlgrenze `maxErrors`.
  */
 final class Checker(catalog: Catalog, languages: Map[String, SchemaLanguageSupport], limits: Limits, metrics: SchemaMetrics,
-                    clock: () => Long = () => System.currentTimeMillis()) {
+                    clock: () => Long = () => System.currentTimeMillis(), cache: Option[CompiledCache] = None) {
 
   private val UnresolvedCodes = Set("unresolved-reference", "unresolved-target")
   private val WrapperUrl = s"${catalog.urls.namespace}_validation/entity-ref.json"
+  private val compiledCache = cache.getOrElse(new CompiledCache(limits.compiledCacheSize))
 
-  private val compiledCache = new java.util.LinkedHashMap[String, CompiledSchema](64, 0.75f, true) {
-    override def removeEldestEntry(eldest: java.util.Map.Entry[String, CompiledSchema]): Boolean = size() > limits.compiledCacheSize
-  }
+  /** Derselbe Checker auf einer anderen Sicht des Lesemodells (Transaktion der Projektion), mit geteiltem Cache. */
+  def on(other: Catalog): Checker = new Checker(other, languages, limits, metrics, clock, Some(compiledCache))
 
-  def compiledCacheSize: Int = compiledCache.synchronized(compiledCache.size())
+  def compiledCacheSize: Int = compiledCache.size
+
+  private def deadline(): Long = System.nanoTime() + limits.maxValidationTime.toNanos
 
   /** Transitive Huelle der Referenzziele, begrenzt in Tiefe und Anzahl (ADR-0069). */
   def closure(record: SchemaRecord): Closure = {
@@ -70,22 +99,20 @@ final class Checker(catalog: Catalog, languages: Map[String, SchemaLanguageSuppo
     var frontier = Seq(record)
     var depth = 0
     while (frontier.nonEmpty && exceeded.isEmpty) {
-      if (depth >= limits.maxReferenceDepth) exceeded = Some(s"Reference depth exceeds ${limits.maxReferenceDepth}")
-      else {
-        val next = Seq.newBuilder[SchemaRecord]
-        frontier.foreach(current => current.refs.foreach { url =>
-          catalog.resolve(url) match {
-            case Some(target) if target.uuid == record.uuid || seen.contains(target.uuid) => ()
-            case Some(target) =>
-              seen(target.uuid) = target
-              next += target
-            case None => missing += url
-          }
-        })
-        if (seen.size > limits.maxReferencedSchemas) exceeded = Some(s"More than ${limits.maxReferencedSchemas} referenced schemas")
-        frontier = next.result()
-        depth += 1
-      }
+      val next = Seq.newBuilder[SchemaRecord]
+      frontier.foreach(current => current.refs.foreach { url =>
+        catalog.resolve(url) match {
+          case Some(target) if target.uuid == record.uuid || seen.contains(target.uuid) => ()
+          case Some(target) =>
+            seen(target.uuid) = target
+            next += target
+          case None => missing += url
+        }
+      })
+      frontier = next.result()
+      depth += 1
+      if (seen.size > limits.maxReferencedSchemas) exceeded = Some(s"More than ${limits.maxReferencedSchemas} referenced schemas")
+      else if (frontier.nonEmpty && depth >= limits.maxReferenceDepth) exceeded = Some(s"Reference depth exceeds ${limits.maxReferenceDepth}")
     }
     Closure(seen.values.toSeq, missing.toSeq, exceeded)
   }
@@ -115,7 +142,7 @@ final class Checker(catalog: Catalog, languages: Map[String, SchemaLanguageSuppo
 
   private def contentProblems(record: SchemaRecord, support: SchemaLanguageSupport): Seq[Problem] = {
     val problems = Seq.newBuilder[Problem]
-    problems ++= support.checkDocument(record.document)
+    problems ++= support.checkDocument(record.document, deadline())
     References.extract(record.document, catalog.baseUrl(record)).left.foreach(problems ++= _)
 
     val hull = closure(record)
@@ -152,70 +179,88 @@ final class Checker(catalog: Catalog, languages: Map[String, SchemaLanguageSuppo
           if (target.countsAsReleased) Nil
           else if (record.countsAsReleased) Seq(Problem("target-not-released", "A released meta-schema must bind to a released target schema", Some("/schemaInfo/target")))
           else Seq(Problem.warning("target-not-released", "Meta-schema binds to a draft; copy and re-check it after the target is released"))
-        status ++ Selectors.check(Selectors.extract(record.document), catalog.baseUrl(target), target.document, catalog.document)
+        status ++ Selectors.check(Selectors.extract(record.document), catalog.baseUrl(target), target.document, catalog.document, limits.regexTimeout)
     }
 
+  private def cacheable(record: SchemaRecord, hull: Closure): Boolean =
+    record.isImmutable && hull.records.forall(_.isImmutable) && hull.missing.isEmpty && hull.limitExceeded.isEmpty
+
   private def compile(record: SchemaRecord, support: SchemaLanguageSupport, hull: Closure): Either[Seq[Problem], CompiledSchema] = {
-    val cacheable = record.isImmutable && hull.records.forall(_.isImmutable) && hull.missing.isEmpty
     val key = s"${record.uuid}:${record.etag}"
-    if (cacheable) Option(compiledCache.synchronized(compiledCache.get(key))) match {
-      case Some(compiled) => return Right(compiled)
-      case None => ()
+    val canCache = cacheable(record, hull)
+    compiledCache.get(key).filter(_ => canCache).map(Right(_)).getOrElse {
+      metrics.compilations.incrementAndGet()
+      val result = support.compile(catalog.baseUrl(record), record.document, catalog.document, canCache)
+      if (canCache) result.foreach(compiled => compiledCache.put(key, compiled))
+      result
     }
-    metrics.compilations.incrementAndGet()
-    val result = support.compile(catalog.baseUrl(record), record.document, catalog.document, cacheable)
-    if (cacheable) result.foreach(compiled => compiledCache.synchronized(compiledCache.put(key, compiled)))
-    result
   }
 
   /** Kompiliertes Schema zu einer (auch fragmentierten) Schema-URL, etwa dem `schema`-Property einer Entity. */
-  def compiledFor(schemaUrl: String): Either[EntityValidityState, (SchemaRecord, CompiledSchema)] =
-    catalog.resolve(schemaUrl) match {
-      case None => Left(EntityValidityState.SchemaMissing)
-      case Some(record) => languages.get(record.language) match {
-        case None => Left(EntityValidityState.SchemaMissing)
-        case Some(support) =>
-          val hull = closure(record)
-          val fragment = schemaUrl.indexOf('#') match {
-            case -1 => ""
-            case index => schemaUrl.substring(index)
-          }
-          val result =
-            if (fragment.isEmpty || fragment == "#") compile(record, support, hull)
-            else {
-              // Teilschema (#/$defs/... oder #anchor) ueber ein Hilfsdokument, das nur referenziert.
-              val target = catalog.baseUrl(record) + fragment
-              val cacheable = record.isImmutable && hull.records.forall(_.isImmutable) && hull.missing.isEmpty
-              val key = s"${record.uuid}:${record.etag}:$fragment"
-              Option(compiledCache.synchronized(compiledCache.get(key))).filter(_ => cacheable).map(Right(_)).getOrElse {
-                metrics.compilations.incrementAndGet()
-                val wrapper = ujson.Obj("$schema" -> record.language, "$ref" -> target)
-                val compiled = support.compile(WrapperUrl, wrapper, catalog.document, cacheable)
-                if (cacheable) compiled.foreach(value => compiledCache.synchronized(compiledCache.put(key, value)))
-                compiled
-              }
+  def compiledFor(schemaUrl: String): Either[NotValidated, (SchemaRecord, CompiledSchema)] =
+    catalog.resolve(schemaUrl).toRight(NotValidated(EntityValidityState.SchemaMissing, "Schema URL is not in the local registry"))
+      .flatMap(record => compiledFor(schemaUrl, record).map(compiled => (record, compiled)))
+
+  private def compiledFor(schemaUrl: String, record: SchemaRecord): Either[NotValidated, CompiledSchema] =
+    languages.get(record.language) match {
+      case None => Left(NotValidated(EntityValidityState.SchemaMissing, s"Schema language '${record.language}' is not supported"))
+      case Some(support) =>
+        val hull = closure(record)
+        hull.limitExceeded match {
+          // SCH-A07: die Referenzlimits gelten auch fuer die Entity-Validierung.
+          case Some(reason) => Left(NotValidated(EntityValidityState.SchemaMissing, s"Reference limit: $reason"))
+          case None =>
+            val fragment = schemaUrl.indexOf('#') match {
+              case -1 => ""
+              case index => schemaUrl.substring(index)
             }
-          result.left.map(_ => EntityValidityState.SchemaMissing).map(compiled => (record, compiled))
-      }
+            val result =
+              if (fragment.isEmpty || fragment == "#") compile(record, support, hull)
+              else {
+                // Teilschema (#/$defs/... oder #anchor) ueber ein Hilfsdokument, das nur referenziert.
+                val target = catalog.baseUrl(record) + fragment
+                val canCache = cacheable(record, hull)
+                val key = s"${record.uuid}:${record.etag}:$fragment"
+                compiledCache.get(key).filter(_ => canCache).map(Right(_)).getOrElse {
+                  metrics.compilations.incrementAndGet()
+                  val wrapper = ujson.Obj("$schema" -> record.language, "$ref" -> target)
+                  val compiled = support.compile(WrapperUrl, wrapper, catalog.document, canCache)
+                  if (canCache) compiled.foreach(value => compiledCache.put(key, value))
+                  compiled
+                }
+              }
+            result.left.map(problems => NotValidated(EntityValidityState.SchemaMissing,
+              s"Schema is not compilable: ${problems.headOption.fold("see its validity")(_.message)}"))
+        }
     }
 
-  /** Validiert JSON gegen eine Schema-URL (REQ-SCH-009). */
-  def validateData(schemaUrl: String, data: ujson.Value, maxErrors: Int): Either[EntityValidityState, (SchemaRecord, ValidationOutcome)] =
-    compiledFor(schemaUrl).map((record, compiled) => (record, compiled.validate(data, maxErrors)))
+  /**
+   * Validiert JSON gegen eine Schema-URL (REQ-SCH-009) mit Instanzgroessen-, Zeit- und Fehlerbudget.
+   * Ein erreichtes Limit ergibt ein Ergebnis mit `aborted`.
+   */
+  def validateData(schemaUrl: String, data: ujson.Value, keepErrors: Int): Either[NotValidated, (SchemaRecord, ValidationOutcome)] =
+    catalog.resolve(schemaUrl).toRight(NotValidated(EntityValidityState.SchemaMissing, "Schema URL is not in the local registry")).flatMap { record =>
+      val size = ujson.write(data).getBytes(StandardCharsets.UTF_8).length
+      if (size > limits.maxInstanceBytes)
+        Right((record, ValidationOutcome.limit(s"Instance has $size bytes, limit is ${limits.maxInstanceBytes}")))
+      else compiledFor(schemaUrl, record).map { compiled =>
+        (record, compiled.validate(data, ValidationBudget(math.min(keepErrors, limits.maxErrors), limits.maxErrors, deadline())))
+      }
+    }
 
   /** Kompaktes Entity-Validierungsergebnis (ADR-0064). */
   def validateEntity(state: EntityState): EntityValidity = {
     metrics.entityValidations.incrementAndGet()
     val result = validateData(state.schema, state.data, limits.storedErrors) match {
-      case Left(missingState) =>
+      case Left(NotValidated(missingState, detail)) =>
         val record = catalog.resolve(state.schema)
         EntityValidity(state.id, missingState, state.schema, record.map(_.uuid), record.flatMap(_.info).flatMap(_.internal).map(_.version),
-          record.map(_.entityVersion), state.entityVersion, 0, Nil, clock(),
-          Some(record.fold("Schema URL is not in the local registry")(_ => "Schema is not compilable; see its validity")))
+          record.map(_.entityVersion), state.entityVersion, 0, Nil, clock(), Some(detail))
       case Right((record, outcome)) =>
         EntityValidity(state.id, if (outcome.valid) EntityValidityState.Valid else EntityValidityState.Invalid, state.schema,
           Some(record.uuid), record.info.flatMap(_.internal).map(_.version), Some(record.entityVersion), state.entityVersion,
-          outcome.errorCount, outcome.errors, clock())
+          outcome.errorCount, outcome.errors, clock(),
+          outcome.aborted.map(reason => s"Not fully validated: $reason"), errorCountTruncated = outcome.truncated)
     }
     if (result.state == EntityValidityState.Invalid) metrics.entityValidationsInvalid.incrementAndGet()
     result
@@ -234,7 +279,7 @@ final class Checker(catalog: Catalog, languages: Map[String, SchemaLanguageSuppo
     val info = record.info
     if (!info.exists(_.isDraft)) problems += Problem("not-a-draft", "Only drafts can be released")
     if (validity.state != ValidityState.Valid)
-      problems +=Problem("schema-not-valid", s"Schema validity is '${validity.state.wire}'")
+      problems += Problem("schema-not-valid", s"Schema validity is '${validity.state.wire}'")
 
     val identity = info.flatMap(_.internal)
     val branch = info.flatMap(_.branch)

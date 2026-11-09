@@ -173,7 +173,9 @@ final case class EntityValidity(
   errorCount: Int,
   errors: Seq[ValidationError],
   checkedAt: Long,
-  detail: Option[String] = None
+  detail: Option[String] = None,
+  /** Die Fehlerzaehlung hat bei `validation.max-errors` abgebrochen; die wahre Zahl ist groesser. */
+  errorCountTruncated: Boolean = false
 ) {
   def toJson: ujson.Value = {
     val obj = ujson.Obj(
@@ -188,6 +190,7 @@ final case class EntityValidity(
     schemaVersion.foreach(value => obj("schemaVersion") = value)
     schemaEntityVersion.foreach(value => obj("schemaEntityVersion") = ujson.Num(value.toDouble))
     detail.foreach(value => obj("detail") = value)
+    if (errorCountTruncated) obj("errorCountTruncated") = true
     obj
   }
 }
@@ -204,7 +207,8 @@ object EntityValidity {
     value("errorCount").num.toInt,
     value("errors").arr.toSeq.map(ValidationError.fromJson),
     java.time.Instant.parse(value("checkedAt").str).toEpochMilli,
-    value.obj.get("detail").map(_.str))
+    value.obj.get("detail").map(_.str),
+    value.obj.get("errorCountTruncated").exists(_.bool))
 }
 
 /**

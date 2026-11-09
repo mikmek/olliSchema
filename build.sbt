@@ -39,6 +39,9 @@ lazy val root = project.in(file("."))
       "ch.qos.logback" % "logback-classic" % "1.5.32",
       "com.typesafe" % "config" % "1.4.7",
       "org.scalatest" %% "scalatest" % "3.2.20" % Test,
+      // Echte Redis fuer den Test des atomaren Commit-Skripts (SCH-A08); der Test wird uebersprungen,
+      // wenn die mitgelieferte Binaerdatei auf der Plattform nicht startet.
+      "com.github.kstyrc" % "embedded-redis" % "0.6" % Test,
       "org.apache.pekko" %% "pekko-http-testkit" % pekkoHttpVersion % Test,
       // ScalatestRouteTest needs the classic testkit; pekko-http-testkit declares it as provided.
       "org.apache.pekko" %% "pekko-testkit" % pekkoVersion % Test,

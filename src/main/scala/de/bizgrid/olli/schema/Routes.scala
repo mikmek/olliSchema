@@ -119,8 +119,8 @@ final class Routes(catalog: Catalog, checker: Checker, projection: Projection, e
               metrics.apiValidations.incrementAndGet()
               val maxErrors = request.obj.get("maxErrors").flatMap(_.numOpt).map(_.toInt).filter(_ > 0).fold(limits.maxErrors)(math.min(_, limits.maxErrors))
               checker.validateData(schema, data, maxErrors) match {
-                case Left(state) => json(StatusCodes.UnprocessableContent, ujson.Obj("state" -> state.wire, "schemaUrl" -> schema,
-                  "error" -> "Schema is not in the local registry or not compilable"))
+                case Left(NotValidated(state, detail)) => json(StatusCodes.UnprocessableContent, ujson.Obj("state" -> state.wire, "schemaUrl" -> schema,
+                  "error" -> detail))
                 case Right((record, outcome)) => ok(outcomeJson(schema, record, outcome))
               }
             case _ => json(StatusCodes.BadRequest, Json.error("Body must contain 'schema' (URL) and 'data'"))
@@ -137,8 +137,8 @@ final class Routes(catalog: Catalog, checker: Checker, projection: Projection, e
             // Volle Fehlerliste wird neu berechnet, nicht gespeichert (ADR-0064).
             metrics.apiValidations.incrementAndGet()
             checker.validateData(state.schema, state.data, limits.maxErrors) match {
-              case Left(missing) => ok(ujson.Obj("entityId" -> id.toString, "state" -> missing.wire, "schemaUrl" -> state.schema,
-                "entityVersion" -> ujson.Num(state.entityVersion.toDouble)))
+              case Left(NotValidated(missing, detail)) => ok(ujson.Obj("entityId" -> id.toString, "state" -> missing.wire, "schemaUrl" -> state.schema,
+                "entityVersion" -> ujson.Num(state.entityVersion.toDouble), "detail" -> detail))
               case Right((record, outcome)) =>
                 val body = outcomeJson(state.schema, record, outcome)
                 body("entityId") = id.toString
@@ -274,6 +274,8 @@ final class Routes(catalog: Catalog, checker: Checker, projection: Projection, e
       "errorCount" -> outcome.errorCount,
       "errors" -> ujson.Arr.from(outcome.errors.map(_.toJson)))
     record.info.flatMap(_.internal).foreach(identity => obj("schemaVersion") = identity.version)
+    if (outcome.truncated) obj("errorCountTruncated") = true
+    outcome.aborted.foreach(reason => obj("detail") = s"Not fully validated: $reason")
     obj
   }
 }

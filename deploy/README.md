@@ -1,6 +1,6 @@
 # Lokaler Build und Deployment auf olli-server
 
-Stand: 2026-11-07. Umsetzung für olliSchema als erster Service.
+Stand: 2026-11-07, ergänzt 2026-11-09 (Voraussetzungen, Werkzeugtests). Umsetzung für olliSchema als erster Service.
 GitHub speichert Quellcode; Build/Tests laufen auf dem Notebook. Es werden keine GitHub
 Actions oder Registry benötigt. Release `20261107T151434Z-91761c2624e7` wurde übertragen
 und direkt in einer SSH-Sitzung aktiviert. Readiness vom Notebook und der Statusaufruf
@@ -16,6 +16,8 @@ ein realer Rollback-Test stehen noch aus.
 - Server: Python 3.12+, Docker/Compose, Netz `infrastructure_default`, laufender Kafka-Broker
   und die Entity-APIs. Bestehendes Redis-Image `olli-migration/image-b6636bae9624:backup`.
 - HDD unter `/srv/olli-data` tatsächlich gemountet; keine öffentliche Portfreigabe erforderlich.
+- `/srv/olli/config/infrastructure.env` mit expliziter privater `OLLI_BIND_ADDRESS` (nicht `0.0.0.0`)
+  und mindestens 3 GiB frei auf der System-SSD; beides prüft der Preflight.
 
 Der Build publiziert olliEventCore aus dem geprüften Commit neu in die lokalen Paket-Caches.
 Dadurch wird das bisherige SNAPSHOT nicht einfach aus einem unbekannten Cache übernommen.
@@ -147,7 +149,11 @@ Werkzeugtests ohne Serverzugriff:
 
 ```powershell
 python -m unittest discover -s deploy/tests -v
+powershell -File deploy/tests/Test-NativeArguments.ps1
 ```
+
+Der PowerShell-Test prüft die Argumentweitergabe von `Invoke-Checked` an native Programme;
+`unittest discover` erfasst ihn nicht.
 
 Sie prüfen korrupte Archive, Dirty-Source-Abweisung, HTTP-Healthcheck/Redis-Abgrenzung
 und den fehlgeschlagenen kompatiblen Rollout. Ein realer Server-Rollback ist zusätzlich

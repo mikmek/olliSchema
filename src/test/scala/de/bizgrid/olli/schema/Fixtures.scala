@@ -4,19 +4,21 @@ import java.util.UUID
 import scala.concurrent.duration.*
 
 /** Gemeinsamer Aufbau: In-Memory-Lesemodell, echter JSON-Schema-Validator, keine Netzwerkzugriffe. */
-final class Fixtures {
+final class Fixtures(limitsOverride: Limits => Limits = identity, languagesOverride: Option[Map[String, SchemaLanguageSupport]] = None) {
   val SchemaKind: UUID = UUID.fromString("5c4e3a10-0000-4000-8000-000000000001")
   val DataKind: UUID = UUID.fromString("11111111-0000-4000-8000-000000000001")
   val Tenant: UUID = UUID.fromString("22222222-0000-4000-8000-000000000001")
   val Project: UUID = UUID.fromString("33333333-0000-4000-8000-000000000001")
   val Ns = "https://bizgrid.de/ollischema/"
 
-  val limits: Limits = Limits(storedErrors = 3, maxErrors = 100, maxDocumentBytes = 1 << 20, maxReferenceDepth = 8,
-    maxReferencedSchemas = 50, regexTimeout = 200.millis, compiledCacheSize = 50)
+  val limits: Limits = limitsOverride(Limits(storedErrors = 3, maxErrors = 100, maxDocumentBytes = 1 << 20, maxInstanceBytes = 1 << 20,
+    maxReferenceDepth = 8, maxReferencedSchemas = 50, regexTimeout = 200.millis, maxValidationTime = 5.seconds, compiledCacheSize = 50))
   val metrics = new SchemaMetrics
   val store = new InMemorySchemaStore
   val catalog = new Catalog(store, new SchemaUrls(Ns))
-  val checker = new Checker(catalog, Map(SchemaLanguage.JsonSchema202012 -> new JsonSchemaSupport(limits.regexTimeout)), limits, metrics)
+  val languages: Map[String, SchemaLanguageSupport] =
+    languagesOverride.getOrElse(Map(SchemaLanguage.JsonSchema202012 -> new JsonSchemaSupport(limits.regexTimeout)))
+  val checker = new Checker(catalog, languages, limits, metrics)
   val projection = new Projection(catalog, checker, Set(SchemaKind), metrics)
 
   private var offset = 0L

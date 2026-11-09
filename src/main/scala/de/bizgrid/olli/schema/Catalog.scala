@@ -6,6 +6,14 @@ import scala.util.Try
 /** Lesender Zugriff auf das Lesemodell; die einzige Stelle, die Schema-URLs aufloest (ADR-0062). */
 final class Catalog(val store: SchemaStore, val urls: SchemaUrls) {
 
+  /** Derselbe Katalog auf einer anderen Sicht, etwa der Transaktion eines Events (SCH-A08). */
+  def on(other: SchemaStore): Catalog = new Catalog(other, urls)
+
+  /** Meta-Schemas aller Typen, die an eine der Adressen binden (SCH-A04). */
+  def metaSchemaIds(addresses: Seq[String]): Seq[UUID] =
+    addresses.flatMap(address => MetaType.values.toSeq.flatMap(kind => store.members(Keys.meta(address, kind))))
+      .flatMap(value => Try(UUID.fromString(value)).toOption).distinct
+
   def record(uuid: UUID): Option[SchemaRecord] =
     store.get(Keys.doc(uuid)).flatMap(json => Try(SchemaRecord.fromJson(ujson.read(json))).toOption)
 

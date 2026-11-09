@@ -20,9 +20,11 @@ object Settings {
       storedErrors = validation.getInt("stored-errors"),
       maxErrors = validation.getInt("max-errors"),
       maxDocumentBytes = validation.getInt("max-document-bytes"),
+      maxInstanceBytes = validation.getInt("max-instance-bytes"),
       maxReferenceDepth = validation.getInt("max-reference-depth"),
       maxReferencedSchemas = validation.getInt("max-referenced-schemas"),
       regexTimeout = validation.getDuration("regex-timeout").toMillis.millis,
+      maxValidationTime = validation.getDuration("max-validation-time").toMillis.millis,
       compiledCacheSize = validation.getInt("compiled-cache-size"))
   }
 

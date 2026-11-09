@@ -34,8 +34,10 @@ object KafkaSettings {
 
 /**
  * Konsument von `entity.events` (ADR-0063). At-least-once: Offsets werden nach der Verarbeitung eines
- * Polls committet, die Projektion ist idempotent je Entity-Version. Ein unlesbarer oder nicht
- * projizierbarer Record landet in `schema:deadletters` und blockiert die Partition nicht (GREQ-008).
+ * Polls committet, die Projektion ist idempotent je Entity-Version und schreibt je Event atomar
+ * (SCH-A08). Ein unlesbarer oder nicht projizierbarer Record landet in `schema:deadletters` und
+ * blockiert die Partition nicht (GREQ-008); weil vor dem Commit nichts geschrieben wird, hinterlaesst
+ * er keinen halben Zustand. Ist Redis nicht erreichbar, wird ohne Offset-Commit neu verbunden.
  *
  * Wie im EntityIndex wird der KafkaConsumer in der Schleife gebaut; ein fehlender Broker ist ein
  * Retry mit gedeckeltem Backoff, kein Prozessabbruch. `isRunning` meldet die Zeit dazwischen als nicht bereit.

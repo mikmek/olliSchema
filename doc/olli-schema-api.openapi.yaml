@@ -34,45 +34,62 @@ paths:
         Released-, Draft-, `by-id/<uuid>`- und `ext/<herausgeber>/…`-URLs. `Accept: application/schema+json`
         (Default, auch `*/*`) liefert das Dokument, ein ausdrückliches `application/json` die Hülle mit
         Metadaten und Gültigkeit. Released-Stände tragen `Cache-Control: public, max-age=31536000, immutable`,
-        Drafts `no-cache`; alle tragen einen ETag und beantworten `If-None-Match` mit 304.
+        Drafts `no-cache`; alle tragen einen ETag (die Hülle `<etag>-env`) und `Vary: Accept` und beantworten
+        `If-None-Match` mit 304. `X-Olli-Schema-Status` fehlt, wenn `schemaInfo` ungültig ist,
+        `X-Olli-Schema-Validity`, solange keine Gültigkeit gespeichert ist. Bekannte Grenze: Die Hülle wird
+        bei Released-Ständen ebenfalls `immutable` ausgeliefert, obwohl sich ihre Gültigkeit ändern kann.
       parameters:
         - { name: path, in: path, required: true, schema: { type: string }, example: rave/building/room-v1.json }
       responses:
         '200':
           description: Schema
           headers:
-            X-Olli-Schema-Uuid: { schema: { type: string, format: uuid } }
-            X-Olli-Schema-Validity: { schema: { type: string, enum: [valid, invalid, unresolved] } }
-            X-Olli-Schema-Status: { schema: { type: string, enum: [draft, released, deprecated, withdrawn] } }
+            ETag: { $ref: '#/components/headers/ETag' }
+            Cache-Control: { $ref: '#/components/headers/Cache-Control' }
+            Vary: { $ref: '#/components/headers/Vary' }
+            X-Olli-Schema-Uuid: { $ref: '#/components/headers/X-Olli-Schema-Uuid' }
+            X-Olli-Schema-Validity: { $ref: '#/components/headers/X-Olli-Schema-Validity' }
+            X-Olli-Schema-Status: { $ref: '#/components/headers/X-Olli-Schema-Status' }
           content:
             application/schema+json: { schema: { type: object } }
             application/json: { schema: { $ref: '#/components/schemas/SchemaEnvelope' } }
         '304': { description: Not modified }
         '404': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Unavailable' }
 
   /schemas:
     get:
       summary: Listing nach application und domain
       parameters:
         - { name: application, in: query, schema: { type: string }, description: '`ext` listet die Fremdschemas' }
-        - { name: domain, in: query, schema: { type: string } }
-        - { name: status, in: query, schema: { type: string, enum: [draft, released, deprecated, withdrawn] } }
+        - { name: domain, in: query, schema: { type: string }, description: 'Nur zusammen mit application wirksam; ohne application oder bei application=ext ignoriert' }
+        - { name: status, in: query, schema: { type: string, enum: [draft, released, deprecated, withdrawn] }, description: 'Ohne Angabe werden alle Stände geliefert, auch Drafts' }
         - { name: branch, in: query, schema: { type: string } }
       responses:
         '200':
           description: Schemas
           content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/SchemaSummary' } } } } } }
+        '503': { $ref: '#/components/responses/Unavailable' }
   /schemas/{uuid}:
     parameters: [ { $ref: '#/components/parameters/Uuid' } ]
     get:
-      summary: Schema per UUID, Content Negotiation wie /ollischema/{path}
+      summary: Schema per UUID, Content Negotiation, Header und Caching wie /ollischema/{path}
       responses:
         '200':
           description: Schema
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+            Cache-Control: { $ref: '#/components/headers/Cache-Control' }
+            Vary: { $ref: '#/components/headers/Vary' }
+            X-Olli-Schema-Uuid: { $ref: '#/components/headers/X-Olli-Schema-Uuid' }
+            X-Olli-Schema-Validity: { $ref: '#/components/headers/X-Olli-Schema-Validity' }
+            X-Olli-Schema-Status: { $ref: '#/components/headers/X-Olli-Schema-Status' }
           content:
             application/schema+json: { schema: { type: object } }
             application/json: { schema: { $ref: '#/components/schemas/SchemaEnvelope' } }
+        '304': { description: Not modified }
         '404': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Unavailable' }
   /schemas/{uuid}/validity:
     parameters: [ { $ref: '#/components/parameters/Uuid' } ]
     get:
@@ -80,6 +97,7 @@ paths:
       responses:
         '200': { description: Validity, content: { application/json: { schema: { $ref: '#/components/schemas/SchemaValidity' } } } }
         '404': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Unavailable' }
   /schemas/{uuid}/referers:
     parameters: [ { $ref: '#/components/parameters/Uuid' } ]
     get:
@@ -109,6 +127,7 @@ paths:
                           items: { type: array, items: { type: string, format: uuid } }
                   entitiesError: { type: string }
         '404': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Unavailable' }
   /schemas/{uuid}/release-check:
     parameters:
       - { $ref: '#/components/parameters/Uuid' }
@@ -127,6 +146,7 @@ paths:
             `projection-behind` (olliSchema hat die Version noch nicht projiziert, wiederholen) oder
             `version-mismatch` (die Entity ist weiter).
           content: { application/json: { schema: { type: object, properties: { error: { type: string }, projectedVersion: { type: integer }, message: { type: string } } } } }
+        '503': { $ref: '#/components/responses/Unavailable' }
   /schemas/{uuid}/meta:
     parameters:
       - { $ref: '#/components/parameters/Uuid' }
@@ -137,6 +157,9 @@ paths:
         '200':
           description: Meta-schemas
           content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/SchemaSummary' } } } } } }
+        '400': { description: "Unbekannter type, z. B. search (geplant in ADR-0073)", content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Unavailable' }
 
   /validate:
     post:
@@ -151,12 +174,22 @@ paths:
               properties:
                 schema: { type: string, description: 'Schema-URL, auch by-id, Original-URI eines Fremdschemas oder mit Fragment (#/$defs/…)' }
                 data: {}
-                maxErrors: { type: integer, minimum: 1 }
+                maxErrors: { type: integer, description: 'Default und Obergrenze ist validation.max-errors; größere Werte werden gekappt, Werte <= 0 ignoriert' }
       responses:
         '200': { description: Result with full error list, content: { application/json: { schema: { $ref: '#/components/schemas/ValidationResult' } } } }
         '400': { $ref: '#/components/responses/Error' }
-        '422': { description: Schema not in the local registry or not compilable }
-        '503': { description: Validation exceeded its time limit }
+        '422':
+          description: Schema not in the local registry or not compilable
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [state, schemaUrl, error]
+                properties:
+                  state: { type: string, enum: [schema-missing] }
+                  schemaUrl: { type: string }
+                  error: { type: string }
+        '503': { description: "Antwortzeit validation.api-timeout überschritten (die Arbeit wird nicht abgebrochen) oder Anfrage fehlgeschlagen", content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } } }
   /entities/{id}/validation:
     parameters: [ { name: id, in: path, required: true, schema: { type: string, format: uuid } } ]
     get:
@@ -166,11 +199,13 @@ paths:
       responses:
         '200': { description: Compact result or full result, content: { application/json: { schema: { $ref: '#/components/schemas/EntityValidity' } } } }
         '404': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Unavailable' }
     post:
       summary: Entity sofort neu validieren
       responses:
         '200': { description: Result, content: { application/json: { schema: { $ref: '#/components/schemas/EntityValidity' } } } }
         '404': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Unavailable' }
 
   /imports:
     post:
@@ -209,32 +244,54 @@ paths:
                         originalUri: { type: string }
                         url: { type: string }
                         entityId: { type: string, format: uuid }
-                        outcome: { type: string, enum: [registered, already-imported, in-progress] }
+                        outcome:
+                          type: string
+                          enum: [registered, already-imported, in-progress]
+                          description: >-
+                            Bei in-progress (paralleler Import derselben URI) ist url leer und entityId nur ein aus
+                            der URI abgeleiteter Platzhalter, nicht die spätere Entity-ID.
         '400': { $ref: '#/components/responses/Error' }
         '403': { $ref: '#/components/responses/Error' }
         '422': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Unavailable' }
 
   /diagnostics/violations:
     get:
       summary: Zuletzt erkannte Verletzungen der Unveränderlichkeit von Released-Schemas
-      parameters: [ { name: limit, in: query, schema: { type: integer, default: 100, maximum: 1000 } } ]
+      parameters: [ { name: limit, in: query, schema: { type: integer, default: 100 }, description: 'Werte außerhalb 1..1000 werden auf diesen Bereich geklemmt, nicht abgelehnt' } ]
       responses:
         '200': { description: Items, content: { application/json: { schema: { type: object } } } }
+        '503': { $ref: '#/components/responses/Unavailable' }
   /diagnostics/dead-letters:
     get:
       summary: Zuletzt verworfene Records von entity.events (Fundstelle und Grund, kein Payload)
-      parameters: [ { name: limit, in: query, schema: { type: integer, default: 100, maximum: 1000 } } ]
+      parameters: [ { name: limit, in: query, schema: { type: integer, default: 100 }, description: 'Werte außerhalb 1..1000 werden auf diesen Bereich geklemmt, nicht abgelehnt' } ]
       responses:
         '200': { description: Items, content: { application/json: { schema: { type: object } } } }
+        '503': { $ref: '#/components/responses/Unavailable' }
 
 components:
+  headers:
+    ETag: { description: 'Starker ETag des Dokuments; die Hülle trägt <etag>-env', schema: { type: string } }
+    Cache-Control: { description: 'Released/deprecated/withdrawn: public, max-age=31536000, immutable; Draft: no-cache', schema: { type: string } }
+    Vary: { schema: { type: string, const: Accept } }
+    X-Olli-Schema-Uuid: { schema: { type: string, format: uuid } }
+    X-Olli-Schema-Validity: { description: 'Fehlt, solange keine Gültigkeit gespeichert ist', schema: { type: string, enum: [valid, invalid, unresolved] } }
+    X-Olli-Schema-Status: { description: 'Fehlt, wenn schemaInfo ungültig ist', schema: { type: string, enum: [draft, released, deprecated, withdrawn] } }
   parameters:
     Uuid: { name: uuid, in: path, required: true, schema: { type: string, format: uuid } }
   responses:
     Error:
       description: Error
-      content: { application/json: { schema: { type: object, required: [error], properties: { error: { type: string } } } } }
+      content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } }
+    Unavailable:
+      description: Lesemodell bzw. Redis nicht erreichbar, Anfrage fehlgeschlagen oder Antwortzeit überschritten
+      content: { application/json: { schema: { $ref: '#/components/schemas/ErrorBody' } } }
   schemas:
+    ErrorBody:
+      type: object
+      required: [error]
+      properties: { error: { type: string } }
     Health:
       type: object
       properties:
@@ -325,7 +382,7 @@ components:
       type: object
       properties:
         pointer: { type: string, description: JSON Pointer (RFC 6901) in die Instanz }
-        keyword: { type: string }
+        keyword: { type: string, description: "Schema-Keyword; 'limit' markiert ein erreichtes Ressourcenlimit statt eines Schemaverstoßes" }
         message: { type: string }
     ValidationResult:
       type: object
@@ -335,8 +392,10 @@ components:
         schemaUuid: { type: string, format: uuid }
         schemaVersion: { type: integer }
         schemaEntityVersion: { type: integer, format: int64 }
-        errorCount: { type: integer }
+        errorCount: { type: integer, description: 'Zählt höchstens bis validation.max-errors' }
+        errorCountTruncated: { type: boolean, description: 'Zählung bei validation.max-errors abgebrochen; die wahre Zahl ist größer' }
         errors: { type: array, items: { $ref: '#/components/schemas/ValidationError' } }
+        detail: { type: string, description: "Bei erreichtem Zeit- oder Größenlimit 'Not fully validated: …'; dann state invalid und eine Fehlerzeile mit keyword limit" }
     EntityValidity:
       type: object
       properties:
@@ -347,7 +406,8 @@ components:
         schemaVersion: { type: integer }
         schemaEntityVersion: { type: integer, format: int64 }
         entityVersion: { type: integer, format: int64 }
-        errorCount: { type: integer }
+        errorCount: { type: integer, description: 'Zählt höchstens bis validation.max-errors' }
+        errorCountTruncated: { type: boolean, description: 'Zählung bei validation.max-errors abgebrochen; die wahre Zahl ist größer' }
         errors: { type: array, items: { $ref: '#/components/schemas/ValidationError' } }
         checkedAt: { type: string, format: date-time }
         detail: { type: string }
